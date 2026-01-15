@@ -1,0 +1,52 @@
+#!/bin/bash
+# hook-fanout: Fan out Claude Code hooks to multiple servers
+# Usage: echo '{"payload": ...}' | hook-fanout <event-name>
+#
+# Targets are checked for availability before posting.
+# Failed/unavailable targets are silently skipped.
+
+set -e
+
+EVENT="${1:-unknown}"
+
+# Read payload from stdin
+PAYLOAD=$(cat)
+
+# Define targets: "name|port|path"
+TARGETS=(
+  "agentwatch|8702|/api/hooks"
+  "awm|8750|/hooks"
+)
+
+# Quick port check using /dev/tcp (bash builtin, no external deps)
+port_open() {
+  local port=$1
+  (echo >/dev/tcp/localhost/$port) 2>/dev/null
+}
+
+# Post to a target
+post_hook() {
+  local name=$1
+  local port=$2
+  local path=$3
+
+  if port_open "$port"; then
+    # Post with short timeout, ignore errors
+    echo "$PAYLOAD" | curl -sS --connect-timeout 0.5 --max-time 2 \
+      -X POST "http://localhost:${port}${path}/${EVENT}" \
+      -H 'Content-Type: application/json' \
+      -d @- 2>/dev/null || true
+  fi
+}
+
+# Fan out to all available targets
+for target in "${TARGETS[@]}"; do
+  IFS='|' read -r name port path <<< "$target"
+  post_hook "$name" "$port" "$path" &
+done
+
+# Wait for all background posts to complete
+wait
+
+# Always exit success so Claude isn't blocked
+exit 0
