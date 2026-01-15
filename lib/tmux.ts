@@ -1,4 +1,10 @@
-import type { TmuxSessionInfo, TmuxWindowInfo, TmuxPaneInfo } from "./types";
+import type { TmuxSessionInfo, TmuxWindowInfo, TmuxPaneInfo, AgentType } from "./types";
+import { AGENT_COMMANDS } from "./types";
+
+/** Escape a string for safe use in single-quoted shell argument */
+export function escapeShellArg(str: string): string {
+  return str.replace(/'/g, "'\"'\"'");
+}
 
 export async function runTmux(args: string[]): Promise<string> {
   const proc = Bun.spawn(["tmux", ...args], {
@@ -64,7 +70,7 @@ export async function listWindows(sessionName: string): Promise<TmuxWindowInfo[]
 
   for (const line of output.split("\n")) {
     const [index, name, active] = line.split("\t");
-    const panes = await listPanes(sessionName, parseInt(index, 10));
+    const panes = await listPanes(sessionName, parseInt(index, 10), name);
 
     windows.push({
       sessionName,
@@ -80,7 +86,8 @@ export async function listWindows(sessionName: string): Promise<TmuxWindowInfo[]
 
 export async function listPanes(
   sessionName: string,
-  windowIndex: number
+  windowIndex: number,
+  windowName = ""
 ): Promise<TmuxPaneInfo[]> {
   const target = `${sessionName}:${windowIndex}`;
   const format = "#{pane_index}\t#{pane_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_idle}";
@@ -94,7 +101,7 @@ export async function listPanes(
     panes.push({
       sessionName,
       windowIndex,
-      windowName: "",
+      windowName,
       paneIndex: parseInt(index, 10),
       paneId: id,
       active: active === "1",
@@ -183,4 +190,41 @@ export async function hasSession(sessionName: string): Promise<boolean> {
   });
   await proc.exited;
   return proc.exitCode === 0;
+}
+
+/** Launch an agent in a new tmux session with a prompt */
+export async function launchAgentSession(
+  agent: AgentType,
+  prompt: string,
+  sessionName: string,
+  cwd: string
+): Promise<void> {
+  const baseCmd = AGENT_COMMANDS[agent][0];
+  const escapedPrompt = escapeShellArg(prompt);
+  const fullCmd = `${baseCmd} '${escapedPrompt}'`;
+
+  const proc = Bun.spawn(
+    ["tmux", "new-session", "-d", "-s", sessionName, "-c", cwd, fullCmd],
+    { stdout: "pipe", stderr: "pipe" }
+  );
+  await proc.exited;
+
+  if (proc.exitCode !== 0) {
+    const stderr = await new Response(proc.stderr).text();
+    throw new Error(`Failed to create tmux session: ${stderr}`);
+  }
+}
+
+/** Capture multiple panes in parallel */
+export async function capturePanes(
+  targets: string[],
+  lines = 10
+): Promise<Map<string, string | undefined>> {
+  const results = await Promise.all(
+    targets.map(async (target) => {
+      const content = await capturePane(target, lines);
+      return [target, content] as const;
+    })
+  );
+  return new Map(results);
 }

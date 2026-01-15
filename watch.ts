@@ -1,6 +1,6 @@
 import { parseArgs } from "util";
-import { listSessions, capturePane } from "./lib/tmux";
-import type { TmuxSessionInfo, TmuxWindowInfo, TmuxPaneInfo } from "./lib/types";
+import { listSessions, capturePanes } from "./lib/tmux";
+import type { TmuxSessionInfo } from "./lib/types";
 
 const ANSI = {
   clear: "\x1b[2J\x1b[H",
@@ -44,6 +44,23 @@ async function renderSessions(
     return output;
   }
 
+  // Collect all pane targets for batch capture
+  const paneTargets: string[] = [];
+  if (showLastLine) {
+    for (const session of sessions) {
+      for (const window of session.windowList) {
+        for (const pane of window.panes) {
+          paneTargets.push(`${session.name}:${window.index}.${pane.paneIndex}`);
+        }
+      }
+    }
+  }
+
+  // Batch capture all panes in parallel
+  const capturedLines = showLastLine
+    ? await capturePanes(paneTargets)
+    : new Map<string, string | undefined>();
+
   for (const session of sessions) {
     const attachIcon = session.attached ? `${ANSI.green}●${ANSI.reset}` : `${ANSI.dim}○${ANSI.reset}`;
     const activityStr = session.activity
@@ -68,7 +85,7 @@ async function renderSessions(
 
         if (showLastLine) {
           const target = `${session.name}:${window.index}.${pane.paneIndex}`;
-          const lastLine = await capturePane(target);
+          const lastLine = capturedLines.get(target);
           if (lastLine) {
             const truncated = lastLine.slice(0, 60);
             output += `      ${ANSI.dim}${truncated}${lastLine.length > 60 ? "..." : ""}${ANSI.reset}\n`;

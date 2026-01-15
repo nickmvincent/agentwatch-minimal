@@ -1,9 +1,9 @@
 import { parseArgs } from "util";
 import { createId, createSessionName } from "./lib/ids";
+import { launchAgentSession } from "./lib/tmux";
 import {
   type AgentType,
   type LaunchedSession,
-  AGENT_COMMANDS,
   DEFAULT_SESSION_PREFIX,
 } from "./lib/types";
 
@@ -24,25 +24,7 @@ async function launchAgent(
   const sessionName = createSessionName(prefix, agent);
   const id = createId("launch");
 
-  // Build command with prompt as argument
-  // Claude: claude "prompt"
-  // Codex: codex "prompt"
-  // Gemini: gemini "prompt"
-  const baseCmd = AGENT_COMMANDS[agent][0];
-  const escapedPrompt = prompt.replace(/'/g, "'\"'\"'"); // Escape single quotes for shell
-  const fullCmd = `${baseCmd} '${escapedPrompt}'`;
-
-  // Create tmux session with the command
-  const proc = Bun.spawn(
-    ["tmux", "new-session", "-d", "-s", sessionName, "-c", cwd, fullCmd],
-    { stdout: "pipe", stderr: "pipe" }
-  );
-  await proc.exited;
-
-  if (proc.exitCode !== 0) {
-    const stderr = await new Response(proc.stderr).text();
-    throw new Error(`Failed to create tmux session: ${stderr}`);
-  }
+  await launchAgentSession(agent, prompt, sessionName, cwd);
 
   return {
     id,
@@ -101,16 +83,20 @@ Examples:
   console.log(`  CWD: ${cwd}`);
   console.log();
 
-  const launched: LaunchedSession[] = [];
+  // Launch all agents in parallel
+  const results = await Promise.allSettled(
+    agents.map((agent) => launchAgent(agent, prompt, cwd, prefix))
+  );
 
-  for (const agent of agents) {
-    try {
-      console.log(`Starting ${agent}...`);
-      const session = await launchAgent(agent, prompt, cwd, prefix);
-      launched.push(session);
-      console.log(`  Session: ${session.sessionName}`);
-    } catch (err) {
-      console.error(`  Failed: ${err}`);
+  const launched: LaunchedSession[] = [];
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i];
+    const agent = agents[i];
+    if (result.status === "fulfilled") {
+      launched.push(result.value);
+      console.log(`Started ${agent}: ${result.value.sessionName}`);
+    } else {
+      console.error(`Failed ${agent}: ${result.reason}`);
     }
   }
 
