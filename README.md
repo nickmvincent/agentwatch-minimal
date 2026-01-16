@@ -6,9 +6,11 @@ Lightweight toolkit for launching and monitoring coding agents (Claude Code, Cod
 
 - **launch** - Spawn agents with the same prompt in parallel tmux sessions
 - **orchestrate** - Use Claude to decompose complex prompts into parallel sub-tasks
-- **watch** - Monitor tmux sessions with a live ANSI display (CPU/memory, duration)
-- **hooks** - HTTP server for logging Claude Code hook events
-- **hooks-watch** - Live TUI for watching hook events
+- **watch** - Unified TUI: monitor tmux sessions + Claude Code hooks in two-column layout
+  - Embedded hooks server on port 8750
+  - CPU/memory stats, session duration, pane output
+  - Interactive keybinds for navigation, attach, kill
+  - `--hooks-daemon` mode for headless hook server
 - **notifications** - Desktop and webhook notifications for hook events
 
 ## Install
@@ -50,8 +52,9 @@ tmux attach -t awm-claude-xxx
 |---------|----------|
 | `launch.ts` | Run the same task on multiple agents to compare approaches |
 | `orchestrate.ts` | Break a complex task into parallel sub-tasks automatically |
-| `watch.ts` | Monitor multiple agents running simultaneously |
-| `hooks.ts` | Debug/audit Claude Code tool usage |
+| `watch.ts` | Monitor sessions + hooks in unified TUI (default) |
+| `watch.ts --hooks-daemon` | Run headless hooks server only |
+| `watch.ts --no-hooks` | Monitor sessions only (no hooks server) |
 
 ### Session Naming
 
@@ -81,13 +84,12 @@ alias awm="bun run $AWM_PATH/launch.ts"
 alias awm2="bun run $AWM_PATH/launch.ts --agents claude,codex"
 alias awm-all="bun run $AWM_PATH/launch.ts --agents claude,codex,gemini"
 
-# Watch sessions
-alias awm-watch="bun run $AWM_PATH/watch.ts --filter awm --stats"
-alias awm-w="awm-watch --last-line"
+# Watch sessions + hooks (unified TUI)
+alias awm-watch="bun run $AWM_PATH/watch.ts --filter awm"
+alias awm-w="awm-watch --last-line --stats"
 
-# Hooks
-alias awm-hooks="bun run $AWM_PATH/hooks-watch.ts"
-alias awm-server="bun run $AWM_PATH/hooks.ts"
+# Hooks server only (daemon mode)
+alias awm-hooks="bun run $AWM_PATH/watch.ts --hooks-daemon"
 
 # Orchestrate
 alias awm-orch="bun run $AWM_PATH/orchestrate.ts"
@@ -149,7 +151,7 @@ bun run launch.ts "Refactor" --agents codex --codex-flags "--approval-mode full-
 
 ### watch.ts
 
-Interactive TUI for monitoring tmux sessions.
+Unified TUI for monitoring tmux sessions and Claude Code hooks. Includes an embedded HTTP server that receives hook events and displays them in a two-column layout alongside your sessions.
 
 ```bash
 bun run watch.ts [options]
@@ -161,6 +163,12 @@ bun run watch.ts [options]
 | `--interval` | `-i` | `2000` | Refresh interval in milliseconds |
 | `--last-line` | `-l` | `false` | Show last line of output from each pane |
 | `--stats` | `-s` | `false` | Show CPU/memory stats for each pane |
+| `--hooks-port` | | `8750` | Hooks server port |
+| `--no-hooks` | | `false` | Disable embedded hooks server |
+| `--hooks-daemon` | | `false` | Run only hooks server (no TUI) |
+| `--data-dir` | `-d` | `~/.agentwatch-minimal` | Data directory for hooks |
+| `--notify-desktop` | | `false` | Send desktop notifications |
+| `--notify-webhook` | | (none) | Send webhooks to URL |
 | `--once` | `-o` | `false` | Run once and exit (no refresh loop) |
 | `--no-interactive` | | `false` | Disable interactive mode |
 | `--help` | `-h` | | Show help |
@@ -175,18 +183,25 @@ bun run watch.ts [options]
 | `x` | Kill selected session |
 | `l` | Toggle last-line display |
 | `s` | Toggle stats display |
+| `h` | Toggle hooks panel |
 | `r` | Refresh now |
-| `h`/`?` | Toggle help |
+| `?` | Toggle help |
 | `q` | Quit |
 
 **Examples:**
 
 ```bash
-# Watch all awm sessions (interactive)
+# Watch sessions with hooks panel (default)
 bun run watch.ts --filter awm
 
-# With stats and last-line enabled by default
+# With stats and last-line enabled
 bun run watch.ts --filter awm --last-line --stats
+
+# Sessions only (no hooks server)
+bun run watch.ts --filter awm --no-hooks
+
+# Hooks server only (daemon mode, no TUI)
+bun run watch.ts --hooks-daemon
 
 # One-shot status check (non-interactive)
 bun run watch.ts --filter awm --once
@@ -232,7 +247,9 @@ bun run orchestrate.ts "Complex multi-step task" --wait
 
 ---
 
-### hooks.ts
+### hooks.ts (standalone)
+
+> **Note:** The unified `watch.ts` now includes an embedded hooks server. Use `watch.ts --hooks-daemon` for a headless hooks server. This standalone file is kept for backwards compatibility.
 
 HTTP server for logging Claude Code hook events with optional notifications.
 
@@ -276,7 +293,9 @@ bun run hooks.ts --notify-desktop --notify-filter pre-tool-use,error
 
 ---
 
-### hooks-watch.ts
+### hooks-watch.ts (standalone)
+
+> **Note:** The unified `watch.ts` now displays hooks in a two-column layout alongside sessions. This standalone file is kept for backwards compatibility or if you want a hooks-only view.
 
 Live TUI for watching hook events.
 
