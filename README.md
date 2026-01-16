@@ -366,7 +366,7 @@ Add to `~/.claude/settings.json`:
 
 ### Hook Fanout (Multiple Servers)
 
-Use `bin/hook-fanout` to send hooks to multiple servers:
+Use `bin/hook-fanout` to send hooks to multiple servers (e.g., both agentwatch on 8702 and awm on 8750):
 
 ```bash
 # Install
@@ -381,10 +381,20 @@ Configure in `~/.claude/settings.json`:
   "hooks": {
     "PreToolUse": [
       { "hooks": [{ "type": "command", "command": "~/.local/bin/hook-fanout pre-tool-use" }] }
+    ],
+    "PostToolUse": [
+      { "hooks": [{ "type": "command", "command": "~/.local/bin/hook-fanout post-tool-use" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "~/.local/bin/hook-fanout stop" }] }
     ]
   }
 }
 ```
+
+Default targets in the script:
+- `agentwatch` → port 8702 (`/api/hooks`)
+- `awm` → port 8750 (`/hooks`)
 
 Edit the `TARGETS` array in the script to customize endpoints.
 
