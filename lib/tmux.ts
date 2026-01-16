@@ -1,4 +1,4 @@
-import type { TmuxSessionInfo, TmuxWindowInfo, TmuxPaneInfo, AgentType } from "./types";
+import type { TmuxSessionInfo, TmuxWindowInfo, TmuxPaneInfo, AgentType, ProcessStats } from "./types";
 import { AGENT_COMMANDS } from "./types";
 
 /** Escape a string for safe use in single-quoted shell argument */
@@ -90,20 +90,21 @@ export async function listPanes(
   windowName = ""
 ): Promise<TmuxPaneInfo[]> {
   const target = `${sessionName}:${windowIndex}`;
-  const format = "#{pane_index}\t#{pane_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_idle}";
+  const format = "#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_idle}";
   const output = await runTmux(["list-panes", "-t", target, "-F", format]);
   if (!output) return [];
 
   const panes: TmuxPaneInfo[] = [];
 
   for (const line of output.split("\n")) {
-    const [index, id, active, command, cwd, idle] = line.split("\t");
+    const [index, id, pid, active, command, cwd, idle] = line.split("\t");
     panes.push({
       sessionName,
       windowIndex,
       windowName,
       paneIndex: parseInt(index, 10),
       paneId: id,
+      panePid: pid ? parseInt(pid, 10) : undefined,
       active: active === "1",
       command,
       cwd,
@@ -132,6 +133,25 @@ export async function capturePane(
     return nonEmpty.at(-1);
   } catch {
     return undefined;
+  }
+}
+
+/** Capture full pane content (all lines) */
+export async function capturePaneFull(
+  target: string,
+  lines = 50
+): Promise<string> {
+  try {
+    return await runTmux([
+      "capture-pane",
+      "-t",
+      target,
+      "-p",
+      "-S",
+      `-${lines}`,
+    ]);
+  } catch {
+    return "";
   }
 }
 
@@ -227,4 +247,49 @@ export async function capturePanes(
     })
   );
   return new Map(results);
+}
+
+/** Get CPU/memory stats for a process by PID */
+export async function getProcessStats(pid: number): Promise<ProcessStats | undefined> {
+  try {
+    const proc = Bun.spawn(["ps", "-o", "%cpu,%mem,rss", "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const output = await new Response(proc.stdout).text();
+    await proc.exited;
+
+    if (proc.exitCode !== 0) return undefined;
+
+    // Parse output: skip header, get values
+    const lines = output.trim().split("\n");
+    if (lines.length < 2) return undefined;
+
+    const values = lines[1].trim().split(/\s+/);
+    if (values.length < 3) return undefined;
+
+    return {
+      pid,
+      cpu: parseFloat(values[0]) || 0,
+      memory: parseFloat(values[1]) || 0,
+      rss: parseInt(values[2], 10) || 0,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Get stats for multiple PIDs in parallel */
+export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, ProcessStats>> {
+  const results = await Promise.all(
+    pids.map(async (pid) => {
+      const stats = await getProcessStats(pid);
+      return [pid, stats] as const;
+    })
+  );
+  const map = new Map<number, ProcessStats>();
+  for (const [pid, stats] of results) {
+    if (stats) map.set(pid, stats);
+  }
+  return map;
 }

@@ -3,12 +3,14 @@ import { serve } from "bun";
 import { createId } from "./lib/ids";
 import { appendJsonl, readJsonlTail, expandHome } from "./lib/jsonl";
 import { DEFAULT_HOOKS_PORT, DEFAULT_DATA_DIR, type HookEntry } from "./lib/types";
+import { notifyHook, type NotificationConfig } from "./lib/notify";
 import { parseArgs } from "util";
 
 const app = new Hono();
 
 let dataDir = DEFAULT_DATA_DIR;
 let hooksFile = () => `${dataDir}/hooks.jsonl`;
+let notifyConfig: NotificationConfig = {};
 
 // POST /hooks/:event - Log a hook event
 app.post("/hooks/:event", async (c) => {
@@ -24,6 +26,11 @@ app.post("/hooks/:event", async (c) => {
 
   await appendJsonl(hooksFile(), entry);
   console.log(`[hook] ${event}: ${JSON.stringify(payload).slice(0, 100)}`);
+
+  // Send notification if configured (don't await - fire and forget)
+  if (notifyConfig.desktop || notifyConfig.webhook) {
+    notifyHook(entry, notifyConfig).catch(() => {});
+  }
 
   // Return empty object = approved (no blocking)
   return c.json({});
@@ -72,15 +79,52 @@ if (import.meta.main) {
     options: {
       port: { type: "string", short: "p", default: String(DEFAULT_HOOKS_PORT) },
       "data-dir": { type: "string", short: "d", default: DEFAULT_DATA_DIR },
+      "notify-desktop": { type: "boolean" },
+      "notify-webhook": { type: "string" },
+      "notify-filter": { type: "string" },
+      help: { type: "boolean", short: "h" },
     },
   });
+
+  if (values.help) {
+    console.log(`agentwatch-minimal hooks server
+
+Usage:
+  bun run hooks.ts [options]
+
+Options:
+  -p, --port           Server port (default: ${DEFAULT_HOOKS_PORT})
+  -d, --data-dir       Data directory (default: ${DEFAULT_DATA_DIR})
+  --notify-desktop     Send desktop notifications for hooks
+  --notify-webhook     Send webhooks to URL for each hook
+  --notify-filter      Comma-separated event types to notify (e.g., pre-tool-use,error)
+  -h, --help           Show this help
+
+Examples:
+  bun run hooks.ts
+  bun run hooks.ts --notify-desktop
+  bun run hooks.ts --notify-webhook https://example.com/webhook
+  bun run hooks.ts --notify-desktop --notify-filter pre-tool-use
+`);
+    process.exit(0);
+  }
 
   const port = parseInt(values.port!, 10);
   dataDir = values["data-dir"]!;
 
+  // Configure notifications
+  notifyConfig = {
+    desktop: values["notify-desktop"] ?? false,
+    webhook: values["notify-webhook"],
+    filter: values["notify-filter"]?.split(",").map((s) => s.trim()),
+  };
+
   console.log(`agentwatch-minimal hooks server`);
   console.log(`  Port: ${port}`);
   console.log(`  Data: ${expandHome(hooksFile())}`);
+  if (notifyConfig.desktop) console.log(`  Desktop notifications: enabled`);
+  if (notifyConfig.webhook) console.log(`  Webhook: ${notifyConfig.webhook}`);
+  if (notifyConfig.filter) console.log(`  Notify filter: ${notifyConfig.filter.join(", ")}`);
   console.log();
 
   serve({

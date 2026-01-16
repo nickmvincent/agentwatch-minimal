@@ -6,8 +6,10 @@ Lightweight toolkit for launching and monitoring coding agents (Claude Code, Cod
 
 - **launch** - Spawn agents with the same prompt in parallel tmux sessions
 - **orchestrate** - Use Claude to decompose complex prompts into parallel sub-tasks
-- **watch** - Monitor tmux sessions with a live ANSI display
+- **watch** - Monitor tmux sessions with a live ANSI display (CPU/memory, duration)
 - **hooks** - HTTP server for logging Claude Code hook events
+- **hooks-watch** - Live TUI for watching hook events
+- **notifications** - Desktop and webhook notifications for hook events
 
 ## Install
 
@@ -116,6 +118,7 @@ bun run watch.ts [options]
 | `--filter` | `-f` | (none) | Filter sessions by name prefix |
 | `--interval` | `-i` | `2000` | Refresh interval in milliseconds |
 | `--last-line` | `-l` | `false` | Show last line of output from each pane |
+| `--stats` | `-s` | `false` | Show CPU/memory stats for each pane |
 | `--once` | `-o` | `false` | Run once and exit (no refresh loop) |
 | `--help` | `-h` | | Show help |
 
@@ -125,8 +128,8 @@ bun run watch.ts [options]
 # Watch all awm sessions
 bun run watch.ts --filter awm
 
-# Show last output line (useful to see agent status)
-bun run watch.ts --filter awm --last-line
+# Show last output line and resource stats
+bun run watch.ts --filter awm --last-line --stats
 
 # Faster refresh
 bun run watch.ts --filter awm --interval 500
@@ -177,7 +180,7 @@ bun run orchestrate.ts "Complex multi-step task" --wait
 
 ### hooks.ts
 
-HTTP server for logging Claude Code hook events.
+HTTP server for logging Claude Code hook events with optional notifications.
 
 ```bash
 bun run hooks.ts [options]
@@ -187,6 +190,10 @@ bun run hooks.ts [options]
 |------|-------|---------|-------------|
 | `--port` | `-p` | `8750` | Server port |
 | `--data-dir` | `-d` | `~/.agentwatch-minimal` | Directory for hook logs |
+| `--notify-desktop` | | `false` | Send desktop notifications |
+| `--notify-webhook` | | (none) | Send webhooks to URL |
+| `--notify-filter` | | (none) | Comma-separated events to notify |
+| `--help` | `-h` | | Show help |
 
 **Endpoints:**
 
@@ -203,12 +210,51 @@ bun run hooks.ts [options]
 # Start server
 bun run hooks.ts
 
-# Custom port
-bun run hooks.ts --port 8751
+# With desktop notifications
+bun run hooks.ts --notify-desktop
 
-# Query recent hooks
-curl http://localhost:8750/hooks/recent
-curl http://localhost:8750/hooks/recent?limit=10&event=pre-tool-use
+# With webhook notifications
+bun run hooks.ts --notify-webhook https://example.com/webhook
+
+# Only notify for specific events
+bun run hooks.ts --notify-desktop --notify-filter pre-tool-use,error
+```
+
+---
+
+### hooks-watch.ts
+
+Live TUI for watching hook events.
+
+```bash
+bun run hooks-watch.ts [options]
+```
+
+| Flag | Short | Default | Description |
+|------|-------|---------|-------------|
+| `--source` | | `file` | Source: "file" (JSONL) or "server" (HTTP) |
+| `--port` | `-p` | `8750` | Hooks server port (for server source) |
+| `--data-dir` | `-d` | `~/.agentwatch-minimal` | Data directory (for file source) |
+| `--limit` | `-n` | `20` | Number of recent hooks to show |
+| `--filter` | `-f` | (none) | Filter by event type |
+| `--interval` | `-i` | `1000` | Refresh interval in milliseconds |
+| `--once` | `-o` | `false` | Run once and exit |
+| `--help` | `-h` | | Show help |
+
+**Examples:**
+
+```bash
+# Watch hooks from JSONL file
+bun run hooks-watch.ts
+
+# Filter by event type
+bun run hooks-watch.ts --filter pre-tool-use
+
+# Watch from running server
+bun run hooks-watch.ts --source server
+
+# Show more events
+bun run hooks-watch.ts --limit 50
 ```
 
 ---

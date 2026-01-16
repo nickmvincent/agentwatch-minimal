@@ -38,6 +38,7 @@ export type TmuxPaneInfo = {
   windowName: string;
   paneIndex: number;
   paneId: string;
+  panePid?: number;
   active: boolean;
   command?: string;
   cwd?: string;
@@ -74,6 +75,13 @@ export type HookEntry = {
   timestamp: string;
   event: string;
   payload: Record<string, unknown>;
+};
+
+export type ProcessStats = {
+  pid: number;
+  cpu: number;     // percentage
+  memory: number;  // percentage
+  rss: number;     // KB
 };
 
 export type HooksConfig = {
