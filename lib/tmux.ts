@@ -1,5 +1,5 @@
 import type { TmuxSessionInfo, TmuxWindowInfo, TmuxPaneInfo, AgentType, ProcessStats } from "./types";
-import { AGENT_COMMANDS } from "./types";
+import { AGENT_CONFIGS } from "./types";
 
 /** Escape a string for safe use in single-quoted shell argument */
 export function escapeShellArg(str: string): string {
@@ -217,11 +217,30 @@ export async function launchAgentSession(
   agent: AgentType,
   prompt: string,
   sessionName: string,
-  cwd: string
+  cwd: string,
+  extraFlags: string[] = []
 ): Promise<void> {
-  const baseCmd = AGENT_COMMANDS[agent][0];
+  const config = AGENT_CONFIGS[agent];
   const escapedPrompt = escapeShellArg(prompt);
-  const fullCmd = `${baseCmd} '${escapedPrompt}'`;
+
+  // Build command: command [defaultFlags] [extraFlags] [promptFlag] 'prompt'
+  const parts = [config.command];
+
+  if (config.defaultFlags?.length) {
+    parts.push(...config.defaultFlags);
+  }
+
+  if (extraFlags.length) {
+    parts.push(...extraFlags);
+  }
+
+  if (config.promptFlag) {
+    parts.push(config.promptFlag);
+  }
+
+  parts.push(`'${escapedPrompt}'`);
+
+  const fullCmd = parts.join(" ");
 
   const proc = Bun.spawn(
     ["tmux", "new-session", "-d", "-s", sessionName, "-c", cwd, fullCmd],

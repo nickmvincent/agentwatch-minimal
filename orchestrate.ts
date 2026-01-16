@@ -77,13 +77,21 @@ async function decomposeWithClaude(prompt: string): Promise<SubTask[]> {
   }));
 }
 
+type AgentFlags = Partial<Record<AgentType, string[]>>;
+
+function parseFlags(input: string | undefined): string[] {
+  if (!input) return [];
+  return input.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+}
+
 async function launchSubTask(
   task: SubTask,
   cwd: string,
-  prefix: string
+  prefix: string,
+  agentFlags: AgentFlags = {}
 ): Promise<string> {
   const sessionName = createSessionName(prefix, `${task.agent}-${task.id}`);
-  await launchAgentSession(task.agent, task.prompt, sessionName, cwd);
+  await launchAgentSession(task.agent, task.prompt, sessionName, cwd, agentFlags[task.agent] || []);
   return sessionName;
 }
 
@@ -97,6 +105,9 @@ async function main() {
       prefix: { type: "string", short: "p", default: DEFAULT_SESSION_PREFIX },
       "dry-run": { type: "boolean", short: "n" },
       wait: { type: "boolean", short: "w" },
+      "claude-flags": { type: "string" },
+      "codex-flags": { type: "string" },
+      "gemini-flags": { type: "string" },
       help: { type: "boolean", short: "h" },
     },
     allowPositionals: true,
@@ -109,16 +120,19 @@ Usage:
   bun run orchestrate.ts "complex task description" [options]
 
 Options:
-  -c, --cwd       Working directory for agents
-  -p, --prefix    Session name prefix (default: awm)
-  -n, --dry-run   Show decomposition plan without launching agents
-  -w, --wait      Wait for dependencies and launch dependent tasks automatically
-  -h, --help      Show this help
+  -c, --cwd           Working directory for agents
+  -p, --prefix        Session name prefix (default: awm)
+  -n, --dry-run       Show decomposition plan without launching agents
+  -w, --wait          Wait for dependencies and launch dependent tasks automatically
+  --claude-flags      Extra flags for Claude agents
+  --codex-flags       Extra flags for Codex agents
+  --gemini-flags      Extra flags for Gemini agents
+  -h, --help          Show this help
 
 Examples:
   bun run orchestrate.ts "Build a REST API with auth, validation, and tests"
   bun run orchestrate.ts "Refactor the payment module" --dry-run
-  bun run orchestrate.ts "Complex task with deps" --wait
+  bun run orchestrate.ts "Complex task" --wait --gemini-flags "--yolo"
 `);
     process.exit(0);
   }
@@ -128,6 +142,13 @@ Examples:
   const prefix = values.prefix!;
   const dryRun = values["dry-run"] ?? false;
   const waitForDeps = values.wait ?? false;
+
+  // Parse agent-specific flags
+  const agentFlags: AgentFlags = {
+    claude: parseFlags(values["claude-flags"]),
+    codex: parseFlags(values["codex-flags"]),
+    gemini: parseFlags(values["gemini-flags"]),
+  };
 
   console.log("═".repeat(60));
   console.log("agentwatch-minimal orchestrator");
@@ -190,7 +211,7 @@ Examples:
 
   // Launch independent tasks in parallel
   const independentResults = await Promise.allSettled(
-    independent.map((task) => launchSubTask(task, cwd, prefix))
+    independent.map((task) => launchSubTask(task, cwd, prefix, agentFlags))
   );
 
   for (let i = 0; i < independentResults.length; i++) {
@@ -241,7 +262,7 @@ Examples:
             pending.delete(task.id);
             try {
               console.log(`  [${task.id}] dependencies ready, launching...`);
-              const sessionName = await launchSubTask(task, cwd, prefix);
+              const sessionName = await launchSubTask(task, cwd, prefix, agentFlags);
               launched.set(task.id, sessionName);
               console.log(`  [${task.id}] ${task.description} -> ${sessionName}`);
             } catch (err) {

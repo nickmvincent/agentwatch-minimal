@@ -68,6 +68,44 @@ The default prefix is `awm` (agentwatch-minimal). Use `--prefix` to customize.
 - **Stay organized**: Use `--prefix` to group related sessions (e.g., `--prefix auth-fix`)
 - **Quick check**: Use `watch.ts --once --last-line` for a snapshot without the refresh loop
 
+### Shell Aliases (Recommended)
+
+Add to `~/.zshrc` or `~/.bashrc` for quick access:
+
+```bash
+# Base path (adjust to your install location)
+AWM_PATH="$HOME/projects/agentwatch-minimal"
+
+# Quick launch
+alias awm="bun run $AWM_PATH/launch.ts"
+alias awm2="bun run $AWM_PATH/launch.ts --agents claude,codex"
+alias awm-all="bun run $AWM_PATH/launch.ts --agents claude,codex,gemini"
+
+# Watch sessions
+alias awm-watch="bun run $AWM_PATH/watch.ts --filter awm --stats"
+alias awm-w="awm-watch --last-line"
+
+# Hooks
+alias awm-hooks="bun run $AWM_PATH/hooks-watch.ts"
+alias awm-server="bun run $AWM_PATH/hooks.ts"
+
+# Orchestrate
+alias awm-orch="bun run $AWM_PATH/orchestrate.ts"
+```
+
+**Example workflow:**
+
+```bash
+# Compare claude and codex on same task
+awm2 "Fix the authentication bug in src/auth.ts"
+
+# Watch them work (in another terminal)
+awm-w
+
+# Attach to a specific session
+tmux attach -t awm-claude-xxx
+```
+
 ---
 
 ## CLI Reference
@@ -85,6 +123,9 @@ bun run launch.ts "your prompt" [options]
 | `--agents` | `-a` | `claude` | Comma-separated agents: claude, codex, gemini |
 | `--cwd` | `-c` | current dir | Working directory for agents |
 | `--prefix` | `-p` | `awm` | Session name prefix |
+| `--claude-flags` | | (none) | Extra flags for Claude |
+| `--codex-flags` | | (none) | Extra flags for Codex |
+| `--gemini-flags` | | (none) | Extra flags for Gemini |
 | `--help` | `-h` | | Show help |
 
 **Examples:**
@@ -99,15 +140,16 @@ bun run launch.ts "Write unit tests" --agents claude,codex
 # Custom working directory
 bun run launch.ts "Refactor this module" --cwd /path/to/project
 
-# Custom prefix for grouping
-bun run launch.ts "Debug issue #42" --prefix issue42
+# With agent-specific flags
+bun run launch.ts "Auto-fix tests" --agents gemini --gemini-flags "--yolo"
+bun run launch.ts "Refactor" --agents codex --codex-flags "--approval-mode full-auto"
 ```
 
 ---
 
 ### watch.ts
 
-Monitor tmux sessions with a live display.
+Interactive TUI for monitoring tmux sessions.
 
 ```bash
 bun run watch.ts [options]
@@ -120,21 +162,33 @@ bun run watch.ts [options]
 | `--last-line` | `-l` | `false` | Show last line of output from each pane |
 | `--stats` | `-s` | `false` | Show CPU/memory stats for each pane |
 | `--once` | `-o` | `false` | Run once and exit (no refresh loop) |
+| `--no-interactive` | | `false` | Disable interactive mode |
 | `--help` | `-h` | | Show help |
+
+**Interactive Keybindings:**
+
+| Key | Action |
+|-----|--------|
+| `j`/`↓` | Move selection down |
+| `k`/`↑` | Move selection up |
+| `Enter`/`a` | Attach to selected session |
+| `x` | Kill selected session |
+| `l` | Toggle last-line display |
+| `s` | Toggle stats display |
+| `r` | Refresh now |
+| `h`/`?` | Toggle help |
+| `q` | Quit |
 
 **Examples:**
 
 ```bash
-# Watch all awm sessions
+# Watch all awm sessions (interactive)
 bun run watch.ts --filter awm
 
-# Show last output line and resource stats
+# With stats and last-line enabled by default
 bun run watch.ts --filter awm --last-line --stats
 
-# Faster refresh
-bun run watch.ts --filter awm --interval 500
-
-# One-shot status check
+# One-shot status check (non-interactive)
 bun run watch.ts --filter awm --once
 ```
 

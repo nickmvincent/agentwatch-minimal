@@ -89,6 +89,28 @@ export type HooksConfig = {
   dataDir: string;
 };
 
+export type AgentConfig = {
+  command: string;
+  defaultFlags?: string[];
+  promptFlag?: string; // If agent needs a flag before prompt (e.g., "-p")
+};
+
+export const AGENT_CONFIGS: Record<AgentType, AgentConfig> = {
+  claude: {
+    command: "claude",
+    defaultFlags: [],
+  },
+  codex: {
+    command: "codex",
+    defaultFlags: [],
+  },
+  gemini: {
+    command: "gemini",
+    defaultFlags: [], // Could add "--yolo" here for auto-approval
+  },
+};
+
+// Legacy compat
 export const AGENT_COMMANDS: Record<AgentType, string[]> = {
   claude: ["claude"],
   codex: ["codex"],
