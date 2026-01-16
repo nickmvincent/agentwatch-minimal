@@ -108,7 +108,7 @@ export async function listPanes(
       active: active === "1",
       command,
       cwd,
-      idleSeconds: parseInt(idle, 10),
+      idleSeconds: idle && !isNaN(parseInt(idle, 10)) ? parseInt(idle, 10) : undefined,
     });
   }
 
