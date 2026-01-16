@@ -12,6 +12,7 @@ Lightweight toolkit for launching and monitoring coding agents (Claude Code, Cod
   - Interactive keybinds for navigation, attach, kill
   - `--hooks-daemon` mode for headless hook server
 - **notifications** - Desktop and webhook notifications for hook events
+- **session metadata** - Log prompts/tags/status in a lightweight JSONL file
 
 ## Install
 
@@ -69,6 +70,7 @@ The default prefix is `awm` (agentwatch-minimal). Use `--prefix` to customize.
 - **Compare agents**: Launch the same prompt to claude and codex, watch them work, see which approach you prefer
 - **Parallel decomposition**: Use `orchestrate.ts` for tasks with independent sub-parts (e.g., "add feature X, write tests, update docs")
 - **Stay organized**: Use `--prefix` to group related sessions (e.g., `--prefix auth-fix`)
+- **Tag progress**: Use `--tag` to label sessions and press `d` in `watch.ts` to mark done
 - **Quick check**: Use `watch.ts --once --last-line` for a snapshot without the refresh loop
 
 ### Shell Aliases (Recommended)
@@ -125,6 +127,9 @@ bun run launch.ts "your prompt" [options]
 | `--agents` | `-a` | `claude` | Comma-separated agents: claude, codex, gemini |
 | `--cwd` | `-c` | current dir | Working directory for agents |
 | `--prefix` | `-p` | `awm` | Session name prefix |
+| `--prompt-file` | | (none) | Read prompt from file (`-` = stdin) |
+| `--data-dir` | `-d` | `~/.agentwatch-minimal` | Data directory for session metadata |
+| `--tag` | | (none) | Tag to label sessions |
 | `--claude-flags` | | (none) | Extra flags for Claude |
 | `--codex-flags` | | (none) | Extra flags for Codex |
 | `--gemini-flags` | | (none) | Extra flags for Gemini |
@@ -145,6 +150,9 @@ bun run launch.ts "Refactor this module" --cwd /path/to/project
 # With agent-specific flags
 bun run launch.ts "Auto-fix tests" --agents gemini --gemini-flags "--yolo"
 bun run launch.ts "Refactor" --agents codex --codex-flags "--approval-mode full-auto"
+
+# Prompt from file
+bun run launch.ts --prompt-file ./prompt.txt --agents claude
 ```
 
 ---
@@ -162,11 +170,13 @@ bun run watch.ts [options]
 | `--filter` | `-f` | (none) | Filter sessions by name prefix |
 | `--interval` | `-i` | `2000` | Refresh interval in milliseconds |
 | `--agents-only` | `-a` | `false` | Only show panes running agents |
+| `--sort` | | (none) | Sort sessions: name, created, activity |
 | `--no-last-line` | | `false` | Hide pane output (shown by default) |
 | `--no-stats` | | `false` | Hide CPU/memory stats (shown by default) |
 | `--hooks-port` | | `8750` | Hooks server port |
 | `--no-hooks` | | `false` | Disable embedded hooks server |
 | `--hooks-daemon` | | `false` | Run only hooks server (no TUI) |
+| `--forward-to` | | (none) | Forward hooks to URL (repeatable) |
 | `--data-dir` | `-d` | `~/.agentwatch-minimal` | Data directory for hooks |
 | `--notify-desktop` | | `false` | Send desktop notifications |
 | `--notify-webhook` | | (none) | Send webhooks to URL |
@@ -182,6 +192,7 @@ bun run watch.ts [options]
 | `k`/`↑` | Move selection up |
 | `Enter`/`a` | Attach to selected session |
 | `x` | Kill selected session |
+| `d` | Mark session done |
 | `l` | Toggle last-line display |
 | `s` | Toggle stats display |
 | `f` | Toggle agents-only filter |
@@ -226,6 +237,11 @@ bun run orchestrate.ts "complex task" [options]
 | `--prefix` | `-p` | `awm` | Session name prefix |
 | `--dry-run` | `-n` | `false` | Show plan without launching agents |
 | `--wait` | `-w` | `false` | Wait for dependencies and auto-launch dependent tasks |
+| `--prompt-file` | | (none) | Read task prompt from file (`-` = stdin) |
+| `--plan-file` | | (none) | Use an existing plan JSON (skip decomposition) |
+| `--save-plan` | | (none) | Save the generated plan to a file |
+| `--data-dir` | `-d` | `~/.agentwatch-minimal` | Data directory for session metadata |
+| `--tag` | | (none) | Tag to label sessions |
 | `--help` | `-h` | | Show help |
 
 **How it works:**
@@ -246,6 +262,12 @@ bun run orchestrate.ts "Refactor the payment module" --dry-run
 
 # Auto-execute dependent tasks when dependencies complete
 bun run orchestrate.ts "Complex multi-step task" --wait
+
+# Save plan to a file
+bun run orchestrate.ts "Refactor the payment module" --save-plan ./plan.json
+
+# Reuse a saved plan
+bun run orchestrate.ts --plan-file ./plan.json
 ```
 
 ---
@@ -337,9 +359,9 @@ bun run hooks-watch.ts --limit 50
 
 ## Claude Code Integration
 
-### Basic Hook Logging
+### Hook Setup
 
-Add to `~/.claude/settings.json`:
+Add to `~/.claude/settings.json` to send hooks to watch.ts:
 
 ```json
 {
@@ -364,39 +386,23 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-### Hook Fanout (Multiple Servers)
+### Forwarding to Multiple Servers
 
-Use `bin/hook-fanout` to send hooks to multiple servers (e.g., both agentwatch on 8702 and awm on 8750):
+If you need to send hooks to multiple servers (e.g., agentwatch-minimal + another service), use the `--forward-to` flag:
 
 ```bash
-# Install
-cp bin/hook-fanout ~/.local/bin/
-chmod +x ~/.local/bin/hook-fanout
+# Forward hooks to another server
+bun run watch.ts --forward-to http://localhost:8702/api/hooks
+
+# Forward to multiple servers
+bun run watch.ts --forward-to http://localhost:8702/api/hooks --forward-to http://example.com/hooks
 ```
 
-Configure in `~/.claude/settings.json`:
+The event name is appended to the URL (e.g., `http://localhost:8702/api/hooks/pre-tool-use`).
 
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      { "hooks": [{ "type": "command", "command": "~/.local/bin/hook-fanout pre-tool-use" }] }
-    ],
-    "PostToolUse": [
-      { "hooks": [{ "type": "command", "command": "~/.local/bin/hook-fanout post-tool-use" }] }
-    ],
-    "Stop": [
-      { "hooks": [{ "type": "command", "command": "~/.local/bin/hook-fanout stop" }] }
-    ]
-  }
-}
-```
+### Legacy: Bash Fanout Script
 
-Default targets in the script:
-- `agentwatch` → port 8702 (`/api/hooks`)
-- `awm` → port 8750 (`/hooks`)
-
-Edit the `TARGETS` array in the script to customize endpoints.
+For client-side fanout (when you can't modify the watch.ts invocation), `bin/hook-fanout` can fan out hooks to multiple servers. See the script for configuration.
 
 ---
 
@@ -405,6 +411,7 @@ Edit the `TARGETS` array in the script to customize endpoints.
 ```
 ~/.agentwatch-minimal/
   hooks.jsonl    # Append-only hook event log
+  sessions.jsonl # Session metadata (prompt previews, tags, status)
 ```
 
 Hook entries are JSON lines with `id`, `timestamp`, `event`, and `payload` fields.

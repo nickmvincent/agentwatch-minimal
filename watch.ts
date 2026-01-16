@@ -1,12 +1,20 @@
 import { parseArgs } from "util";
 import { Hono } from "hono";
 import { serve } from "bun";
-import { listSessions, capturePanes, getProcessStatsBatch, killSession } from "./lib/tmux";
+import {
+  listSessions,
+  capturePanes,
+  getProcessStatsBatch,
+  killSession,
+  renameSession,
+  hasSession,
+} from "./lib/tmux";
 import { createId } from "./lib/ids";
 import { appendJsonl, readJsonlTail, expandHome } from "./lib/jsonl";
 import { notifyHook, type NotificationConfig } from "./lib/notify";
-import type { TmuxSessionInfo, ProcessStats, HookEntry } from "./lib/types";
+import type { TmuxSessionInfo, ProcessStats, HookEntry, SessionMetaEntry } from "./lib/types";
 import { DEFAULT_HOOKS_PORT, DEFAULT_DATA_DIR } from "./lib/types";
+import { appendSessionMeta, buildSessionMetaMap, readSessionMeta } from "./lib/sessions";
 
 const ANSI = {
   clear: "\x1b[2J\x1b[H",
@@ -40,6 +48,8 @@ function isAgentCommand(cmd: string | undefined): boolean {
   return AGENT_COMMANDS.has(cmd.toLowerCase());
 }
 
+type SortMode = "name" | "created" | "activity";
+
 // State for the unified TUI
 type WatchState = {
   filter: string | undefined;
@@ -50,12 +60,16 @@ type WatchState = {
   showHooks: boolean;
   agentsOnly: boolean;
   expandAll: boolean;  // false = only selected session expanded
+  sortBy?: SortMode;
   selectedIndex: number;
   scrollOffset: number;  // for viewport scrolling
   sessions: TmuxSessionInfo[];
+  visibleSessions: TmuxSessionInfo[];
+  sessionMeta: Map<string, SessionMetaEntry>;
   recentHooks: HookEntry[];
   hooksPort: number;
   hooksEnabled: boolean;
+  forwardUrls: string[];  // URLs to forward hooks to
   notifyConfig: NotificationConfig;
   dataDir: string;
 };
@@ -143,6 +157,7 @@ ${ANSI.dim}${"─".repeat(50)}${ANSI.reset}
 
   ${ANSI.cyan}Actions${ANSI.reset}
   x        Kill selected session
+  d        Mark session done
 
   ${ANSI.cyan}General${ANSI.reset}
   ?        Toggle this help
@@ -198,13 +213,66 @@ function countAgentPanes(session: TmuxSessionInfo): number {
     sum + w.panes.filter(p => isAgentCommand(p.command)).length, 0);
 }
 
+function parseSortMode(input: string | undefined): SortMode | undefined {
+  if (!input) return undefined;
+  const normalized = input.toLowerCase();
+  if (normalized === "name" || normalized === "created" || normalized === "activity") {
+    return normalized;
+  }
+  return undefined;
+}
+
+function sortSessions(sessions: TmuxSessionInfo[], sortBy?: SortMode): TmuxSessionInfo[] {
+  if (!sortBy) return sessions;
+  const sorted = [...sessions];
+  if (sortBy === "name") {
+    sorted.sort((a, b) => a.name.localeCompare(b.name));
+  } else if (sortBy === "created") {
+    sorted.sort((a, b) => (b.created ?? 0) - (a.created ?? 0));
+  } else if (sortBy === "activity") {
+    sorted.sort((a, b) => (b.activity ?? 0) - (a.activity ?? 0));
+  }
+  return sorted;
+}
+
+function getVisibleSessions(sessions: TmuxSessionInfo[], agentsOnly: boolean): TmuxSessionInfo[] {
+  if (!agentsOnly) return sessions;
+  return sessions.filter((session) => getFilteredWindows(session, true).length > 0);
+}
+
+function shortId(id: string, maxLen = 8): string {
+  const parts = id.split("_");
+  const base = parts.length > 1 ? parts[1] : id;
+  return base.length > maxLen ? base.slice(0, maxLen) : base;
+}
+
+function truncateLine(input: string, maxLen: number): string {
+  if (input.length <= maxLen) return input;
+  return `${input.slice(0, maxLen - 3)}...`;
+}
+
+function formatSessionMeta(meta: SessionMetaEntry | undefined): string | undefined {
+  if (!meta) return undefined;
+  const parts: string[] = [];
+  if (meta.tag) parts.push(`tag:${meta.tag}`);
+  if (meta.status) parts.push(`status:${meta.status}`);
+  if (meta.taskId) parts.push(meta.taskId);
+  if (meta.planId) parts.push(`plan:${shortId(meta.planId)}`);
+  const label = parts.length > 0 ? `[${parts.join(" ")}]` : "";
+  const preview = meta.promptPreview ?? "";
+  const combined = `${label} ${preview}`.trim();
+  return combined.length > 0 ? combined : undefined;
+}
+
 function renderSessions(
   state: WatchState,
   capturedLines: Map<string, string | undefined>,
   processStats: Map<number, ProcessStats>,
   maxLines: number
 ): string {
-  const { sessions, showLastLine, showStats, selectedIndex, filter, agentsOnly, expandAll, scrollOffset } = state;
+  const { showLastLine, showStats, selectedIndex, filter, agentsOnly, expandAll } = state;
+  const sessions = state.visibleSessions;
+  let { scrollOffset } = state;
   const now = Math.floor(Date.now() / 1000);
 
   const lines: string[] = [];
@@ -222,22 +290,22 @@ function renderSessions(
     return lines.join("\n") + "\n";
   }
 
+  const contentStart = lines.length;
+  let selectedLineIndex = -1;
+
   // Build session entries
-  let visibleIndex = -1;  // Track visible sessions after filtering
   for (let i = 0; i < sessions.length; i++) {
     const session = sessions[i];
     const filteredWindows = getFilteredWindows(session, agentsOnly);
 
-    // Skip session entirely if no matching panes in agents-only mode
-    if (agentsOnly && filteredWindows.length === 0) continue;
-
-    visibleIndex++;
     const isSelected = i === selectedIndex;
     const isExpanded = expandAll || isSelected;
+    const meta = state.sessionMeta.get(session.name);
 
     const attachIcon = session.attached ? `${ANSI.green}●${ANSI.reset}` : `${ANSI.dim}○${ANSI.reset}`;
     const durationSec = session.created ? now - session.created : 0;
     const durationStr = durationSec > 0 ? `${ANSI.dim}${formatDuration(durationSec)}${ANSI.reset}` : "";
+    const statusBadge = meta?.status === "done" ? `${ANSI.dim}[done]${ANSI.reset}` : "";
 
     const selectMark = isSelected ? `${ANSI.inverse}►${ANSI.reset}` : " ";
     const namePart = isSelected
@@ -251,12 +319,21 @@ function renderSessions(
       const summary = agentsOnly || agentCount > 0
         ? `${ANSI.dim}${agentCount} agent${agentCount !== 1 ? "s" : ""}${ANSI.reset}`
         : `${ANSI.dim}${totalPanes}p${ANSI.reset}`;
-      lines.push(`${selectMark}${attachIcon} ${namePart} ${durationStr} ${summary}`);
+      const lineIndex = lines.length - contentStart;
+      if (isSelected) selectedLineIndex = lineIndex;
+      lines.push(`${selectMark}${attachIcon} ${namePart} ${durationStr}${statusBadge ? ` ${statusBadge}` : ""} ${summary}`);
       continue;
     }
 
     // Expanded: show full details
-    lines.push(`${selectMark}${attachIcon} ${namePart} ${durationStr}`);
+    const lineIndex = lines.length - contentStart;
+    if (isSelected) selectedLineIndex = lineIndex;
+    lines.push(`${selectMark}${attachIcon} ${namePart} ${durationStr}${statusBadge ? ` ${statusBadge}` : ""}`.trimEnd());
+
+    const metaLine = formatSessionMeta(meta);
+    if (metaLine) {
+      lines.push(`   ${ANSI.dim}${truncateLine(metaLine, 80)}${ANSI.reset}`);
+    }
 
     for (const window of filteredWindows) {
       const showWindowLine = filteredWindows.length > 1 || window.panes.length > 1;
@@ -285,10 +362,24 @@ function renderSessions(
   }
 
   // Apply viewport scrolling if content exceeds maxLines
-  const contentLines = lines.slice(2);  // Skip header
-  if (contentLines.length <= maxLines) {
+  const contentLines = lines.slice(contentStart);  // Skip header
+  const contentCount = contentLines.length;
+  if (contentCount <= maxLines) {
+    state.scrollOffset = 0;
     return lines.join("\n") + "\n";
   }
+
+  if (selectedLineIndex !== -1) {
+    if (selectedLineIndex < scrollOffset) {
+      scrollOffset = selectedLineIndex;
+    } else if (selectedLineIndex >= scrollOffset + maxLines) {
+      scrollOffset = selectedLineIndex - maxLines + 1;
+    }
+  }
+
+  const maxOffset = Math.max(0, contentCount - maxLines);
+  scrollOffset = Math.max(0, Math.min(scrollOffset, maxOffset));
+  state.scrollOffset = scrollOffset;
 
   // Scroll to keep selection visible
   const visibleContent = contentLines.slice(scrollOffset, scrollOffset + maxLines);
@@ -336,7 +427,8 @@ function renderHooks(state: WatchState): string {
 }
 
 async function renderDisplay(state: WatchState): Promise<string> {
-  const { sessions, showLastLine, showStats, showHelp, showHooks, agentsOnly, expandAll } = state;
+  const { showLastLine, showStats, showHelp, showHooks, agentsOnly, expandAll, sortBy } = state;
+  const sessions = state.visibleSessions;
 
   if (showHelp) {
     return renderHelp();
@@ -354,7 +446,8 @@ async function renderDisplay(state: WatchState): Promise<string> {
   const maxSessionLines = showHooks ? Math.floor(availableLines * 0.7) : availableLines;
 
   // Header
-  output += `${ANSI.bold}agentwatch${ANSI.reset} ${ANSI.dim}${now}${ANSI.reset}\n`;
+  const sortLabel = sortBy ? ` ${ANSI.dim}sort:${sortBy}${ANSI.reset}` : "";
+  output += `${ANSI.bold}agentwatch${ANSI.reset} ${ANSI.dim}${now}${ANSI.reset}${sortLabel}\n`;
 
   // Status indicators
   const indicators = [];
@@ -364,7 +457,7 @@ async function renderDisplay(state: WatchState): Promise<string> {
   if (expandAll) indicators.push(`${ANSI.green}E${ANSI.reset}`);
   if (showHooks) indicators.push(`${ANSI.green}H${ANSI.reset}`);
 
-  output += `${ANSI.dim}[${indicators.join("")}] l:line s:stats f:filter e:expand h:hooks ?:help q:quit${ANSI.reset}\n`;
+  output += `${ANSI.dim}[${indicators.join("")}] l:line s:stats f:filter e:expand h:hooks d:done ?:help q:quit${ANSI.reset}\n`;
   output += `${ANSI.dim}${"─".repeat(70)}${ANSI.reset}\n\n`;
 
   // Collect pane data (only for expanded sessions to save resources)
@@ -376,7 +469,8 @@ async function renderDisplay(state: WatchState): Promise<string> {
     const isExpanded = expandAll || i === state.selectedIndex;
     if (!isExpanded) continue;  // Skip collapsed sessions
 
-    for (const window of session.windowList) {
+    const windows = getFilteredWindows(session, agentsOnly);
+    for (const window of windows) {
       for (const pane of window.panes) {
         if (showLastLine) {
           paneTargets.push(`${session.name}:${window.index}.${pane.paneIndex}`);
@@ -403,9 +497,24 @@ async function renderDisplay(state: WatchState): Promise<string> {
   }
 
   // Footer
-  output += `\n${ANSI.dim}Enter:attach x:kill ↑↓/jk:nav${state.hooksEnabled ? ` │ hooks::${state.hooksPort}` : ""}${ANSI.reset}\n`;
+  output += `\n${ANSI.dim}Enter:attach x:kill d:done ↑↓/jk:nav${state.hooksEnabled ? ` │ hooks::${state.hooksPort}` : ""}${ANSI.reset}\n`;
 
   return output;
+}
+
+// Forward hook to another server (fire and forget)
+async function forwardHook(url: string, event: string, payload: Record<string, unknown>): Promise<void> {
+  try {
+    const fullUrl = url.endsWith("/") ? `${url}${event}` : `${url}/${event}`;
+    await fetch(fullUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(2000),  // 2s timeout
+    });
+  } catch {
+    // Silently ignore forwarding errors
+  }
 }
 
 // Create hooks HTTP server
@@ -430,6 +539,11 @@ function createHooksApp(state: WatchState): Hono {
 
     // Write to file
     await appendJsonl(hooksFile(), entry);
+
+    // Forward to other servers (fire and forget)
+    for (const url of state.forwardUrls) {
+      forwardHook(url, event, payload).catch(() => {});
+    }
 
     // Notify if configured
     if (state.notifyConfig.desktop || state.notifyConfig.webhook) {
@@ -485,6 +599,58 @@ async function attachToSession(sessionName: string): Promise<void> {
   await proc.exited;
 }
 
+async function markSessionDone(state: WatchState, session: TmuxSessionInfo): Promise<void> {
+  const oldName = session.name;
+  let newName = oldName;
+  let renamedFrom: string | undefined;
+
+  if (!oldName.endsWith("-done")) {
+    newName = `${oldName}-done`;
+    if (await hasSession(newName)) {
+      newName = `${newName}-${Date.now().toString(36)}`;
+    }
+    const renamed = await renameSession(oldName, newName);
+    if (!renamed) return;
+    renamedFrom = oldName;
+  }
+
+  const meta = state.sessionMeta.get(oldName);
+  try {
+    const entry = await appendSessionMeta(state.dataDir, {
+      sessionName: newName,
+      agent: meta?.agent,
+      promptPreview: meta?.promptPreview,
+      cwd: meta?.cwd,
+      tag: meta?.tag,
+      planId: meta?.planId,
+      taskId: meta?.taskId,
+      status: "done",
+      renamedFrom,
+      source: "watch",
+    });
+    state.sessionMeta.set(newName, entry);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Warning: failed to write session metadata: ${msg}`);
+  }
+}
+
+async function refreshState(state: WatchState): Promise<void> {
+  const sessions = await listSessions(state.filter);
+  const sorted = sortSessions(sessions, state.sortBy);
+  state.sessions = sorted;
+  state.visibleSessions = getVisibleSessions(sorted, state.agentsOnly);
+
+  const entries = await readSessionMeta(state.dataDir).catch(() => []);
+  state.sessionMeta = buildSessionMetaMap(entries);
+
+  if (state.visibleSessions.length > 0) {
+    state.selectedIndex = Math.min(state.selectedIndex, state.visibleSessions.length - 1);
+  } else {
+    state.selectedIndex = 0;
+  }
+}
+
 async function interactiveLoop(state: WatchState): Promise<void> {
   process.stdout.write(ANSI.hideCursor);
   setupRawMode();
@@ -502,12 +668,13 @@ async function interactiveLoop(state: WatchState): Promise<void> {
 
   process.stdin.on("data", async (key: string) => {
     const code = key.charCodeAt(0);
+    const maxIndex = Math.max(0, state.visibleSessions.length - 1);
 
     if (key === "\x1b[A" || key === "k") {
       state.selectedIndex = Math.max(0, state.selectedIndex - 1);
       needsRefresh = true;
     } else if (key === "\x1b[B" || key === "j") {
-      state.selectedIndex = Math.min(state.sessions.length - 1, state.selectedIndex + 1);
+      state.selectedIndex = Math.min(maxIndex, state.selectedIndex + 1);
       needsRefresh = true;
     } else if (key === "q" || code === 3) {
       cleanup();
@@ -531,19 +698,24 @@ async function interactiveLoop(state: WatchState): Promise<void> {
       needsRefresh = true;
     } else if (key === "r") {
       needsRefresh = true;
-    } else if ((key === "\r" || key === "\n" || key === "a") && state.sessions.length > 0) {
-      const session = state.sessions[state.selectedIndex];
+    } else if ((key === "\r" || key === "\n" || key === "a") && state.visibleSessions.length > 0) {
+      const session = state.visibleSessions[state.selectedIndex];
       if (session) {
         await attachToSession(session.name);
         setupRawMode();
         process.stdout.write(ANSI.hideCursor);
         needsRefresh = true;
       }
-    } else if (key === "x" && state.sessions.length > 0) {
-      const session = state.sessions[state.selectedIndex];
+    } else if (key === "x" && state.visibleSessions.length > 0) {
+      const session = state.visibleSessions[state.selectedIndex];
       if (session) {
         await killSession(session.name);
-        state.selectedIndex = Math.min(state.selectedIndex, Math.max(0, state.sessions.length - 2));
+        needsRefresh = true;
+      }
+    } else if (key === "d" && state.visibleSessions.length > 0) {
+      const session = state.visibleSessions[state.selectedIndex];
+      if (session) {
+        await markSessionDone(state, session);
         needsRefresh = true;
       }
     } else if (state.showHelp) {
@@ -556,14 +728,8 @@ async function interactiveLoop(state: WatchState): Promise<void> {
     const now = Date.now();
 
     if (needsRefresh || now - lastRefresh >= state.intervalMs) {
-      state.sessions = await listSessions(state.filter);
+      await refreshState(state);
       state.recentHooks = hooksBuffer;
-
-      if (state.sessions.length > 0) {
-        state.selectedIndex = Math.min(state.selectedIndex, state.sessions.length - 1);
-      } else {
-        state.selectedIndex = 0;
-      }
 
       const output = await renderDisplay(state);
       process.stdout.write(ANSI.clear);
@@ -589,7 +755,7 @@ async function nonInteractiveLoop(state: WatchState, once: boolean): Promise<voi
   process.on("SIGTERM", cleanup);
 
   while (true) {
-    state.sessions = await listSessions(state.filter);
+    await refreshState(state);
     state.recentHooks = hooksBuffer;
     const output = await renderDisplay(state);
 
@@ -607,6 +773,9 @@ async function daemonMode(state: WatchState): Promise<void> {
   console.log(`agentwatch hooks server (daemon mode)`);
   console.log(`  Port: ${state.hooksPort}`);
   console.log(`  Data: ${expandHome(state.dataDir)}/hooks.jsonl`);
+  if (state.forwardUrls.length > 0) {
+    console.log(`  Forwarding to: ${state.forwardUrls.join(", ")}`);
+  }
   if (state.notifyConfig.desktop) console.log(`  Desktop notifications: enabled`);
   if (state.notifyConfig.webhook) console.log(`  Webhook: ${state.notifyConfig.webhook}`);
   console.log();
@@ -625,10 +794,12 @@ async function main() {
       "no-last-line": { type: "boolean" },
       "no-stats": { type: "boolean" },
       "agents-only": { type: "boolean", short: "a" },
+      sort: { type: "string" },
       hooks: { type: "boolean", default: true },
       "hooks-port": { type: "string", default: String(DEFAULT_HOOKS_PORT) },
       "hooks-daemon": { type: "boolean" },
       "no-hooks": { type: "boolean" },
+      "forward-to": { type: "string", multiple: true },
       "data-dir": { type: "string", short: "d", default: DEFAULT_DATA_DIR },
       "notify-desktop": { type: "boolean" },
       "notify-webhook": { type: "string" },
@@ -649,12 +820,14 @@ Options:
   -f, --filter        Filter sessions by prefix (e.g., awm)
   -i, --interval      Refresh interval in ms (default: 2000)
   -a, --agents-only   Only show panes running agents (claude/codex/gemini)
+  --sort              Sort sessions: name, created, activity
   --no-last-line      Hide pane output (shown by default)
   --no-stats          Hide CPU/memory stats (shown by default)
 
   --hooks-port        Hooks server port (default: ${DEFAULT_HOOKS_PORT})
   --no-hooks          Disable embedded hooks server
   --hooks-daemon      Run only hooks server (no TUI, headless)
+  --forward-to        Forward hooks to URL (can specify multiple)
 
   -d, --data-dir      Data directory (default: ${DEFAULT_DATA_DIR})
   --notify-desktop    Send desktop notifications for hooks
@@ -670,6 +843,7 @@ Interactive Keybindings:
   k/↑       Move selection up
   Enter/a   Attach to selected session
   x         Kill selected session
+  d         Mark session done
   l         Toggle last-line display
   s         Toggle stats display
   f         Toggle agents-only filter
@@ -690,6 +864,14 @@ Examples:
   const hooksEnabled = !values["no-hooks"];
   const hooksPort = parseInt(values["hooks-port"]!, 10);
   const isDaemon = values["hooks-daemon"] ?? false;
+  const sortBy = parseSortMode(values.sort);
+
+  if (values.sort && !sortBy) {
+    console.error("Error: --sort must be one of: name, created, activity");
+    process.exit(1);
+  }
+
+  const forwardUrls = values["forward-to"] ?? [];
 
   const state: WatchState = {
     filter: values.filter,
@@ -700,12 +882,16 @@ Examples:
     showHooks: hooksEnabled,
     agentsOnly: values["agents-only"] ?? false,
     expandAll: false,  // collapsed by default, only selected expanded
+    sortBy,
     selectedIndex: 0,
     scrollOffset: 0,
     sessions: [],
+    visibleSessions: [],
+    sessionMeta: new Map(),
     recentHooks: [],
     hooksPort,
     hooksEnabled,
+    forwardUrls,
     dataDir: values["data-dir"]!,
     notifyConfig: {
       desktop: values["notify-desktop"] ?? false,
