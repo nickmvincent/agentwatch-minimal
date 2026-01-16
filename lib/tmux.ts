@@ -6,6 +6,10 @@ export function escapeShellArg(str: string): string {
   return str.replace(/'/g, "'\"'\"'");
 }
 
+// Cache for tmuxHasServer check (valid for 5 seconds)
+let hasServerCache: { value: boolean; timestamp: number } | null = null;
+const HAS_SERVER_CACHE_TTL = 5000;
+
 export async function runTmux(args: string[]): Promise<string> {
   const proc = Bun.spawn(["tmux", ...args], {
     stdout: "pipe",
@@ -17,14 +21,22 @@ export async function runTmux(args: string[]): Promise<string> {
 }
 
 export async function tmuxHasServer(): Promise<boolean> {
+  // Return cached value if still valid
+  if (hasServerCache && Date.now() - hasServerCache.timestamp < HAS_SERVER_CACHE_TTL) {
+    return hasServerCache.value;
+  }
+
   try {
     const proc = Bun.spawn(["tmux", "list-sessions"], {
       stdout: "pipe",
       stderr: "pipe",
     });
     await proc.exited;
-    return proc.exitCode === 0;
+    const result = proc.exitCode === 0;
+    hasServerCache = { value: result, timestamp: Date.now() };
+    return result;
   } catch {
+    hasServerCache = { value: false, timestamp: Date.now() };
     return false;
   }
 }
@@ -33,17 +45,25 @@ export async function listSessions(filter?: string): Promise<TmuxSessionInfo[]> 
   const hasServer = await tmuxHasServer();
   if (!hasServer) return [];
 
-  const format = "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{session_activity}";
-  const output = await runTmux(["list-sessions", "-F", format]);
-  if (!output) return [];
+  // Fetch sessions and all panes in parallel (2 tmux calls instead of N+M)
+  const sessionFormat = "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{session_activity}";
+  const paneFormat = "#{session_name}\t#{window_index}\t#{window_name}\t#{window_active}\t#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_idle}";
 
-  const sessions: TmuxSessionInfo[] = [];
+  const [sessionOutput, paneOutput] = await Promise.all([
+    runTmux(["list-sessions", "-F", sessionFormat]),
+    runTmux(["list-panes", "-a", "-F", paneFormat]),
+  ]);
 
-  for (const line of output.split("\n")) {
+  if (!sessionOutput) return [];
+
+  // Build session map
+  const sessionMap = new Map<string, TmuxSessionInfo>();
+
+  for (const line of sessionOutput.split("\n")) {
     const [name, windows, attached, created, activity] = line.split("\t");
     if (filter && !name.startsWith(filter)) continue;
 
-    sessions.push({
+    sessionMap.set(name, {
       name,
       windows: parseInt(windows, 10),
       attached: attached === "1",
@@ -53,12 +73,51 @@ export async function listSessions(filter?: string): Promise<TmuxSessionInfo[]> 
     });
   }
 
-  // Fetch windows and panes for each session
-  for (const session of sessions) {
-    session.windowList = await listWindows(session.name);
+  // Build window map for grouping panes
+  const windowMap = new Map<string, TmuxWindowInfo>();
+
+  // Parse all panes and populate sessions
+  if (paneOutput) {
+    for (const line of paneOutput.split("\n")) {
+      const parts = line.split("\t");
+      if (parts.length < 11) continue;
+
+      const [sessionName, windowIndex, windowName, windowActive, paneIndex, paneId, panePid, paneActive, command, cwd, idle] = parts;
+
+      const session = sessionMap.get(sessionName);
+      if (!session) continue; // Session filtered out
+
+      const windowKey = `${sessionName}:${windowIndex}`;
+      let window = windowMap.get(windowKey);
+
+      if (!window) {
+        window = {
+          sessionName,
+          index: parseInt(windowIndex, 10),
+          name: windowName,
+          active: windowActive === "1",
+          panes: [],
+        };
+        windowMap.set(windowKey, window);
+        session.windowList.push(window);
+      }
+
+      window.panes.push({
+        sessionName,
+        windowIndex: parseInt(windowIndex, 10),
+        windowName,
+        paneIndex: parseInt(paneIndex, 10),
+        paneId,
+        panePid: panePid ? parseInt(panePid, 10) : undefined,
+        active: paneActive === "1",
+        command,
+        cwd,
+        idleSeconds: idle && !isNaN(parseInt(idle, 10)) ? parseInt(idle, 10) : undefined,
+      });
+    }
   }
 
-  return sessions;
+  return Array.from(sessionMap.values());
 }
 
 export async function listWindows(sessionName: string): Promise<TmuxWindowInfo[]> {
@@ -284,86 +343,97 @@ const KNOWN_AGENTS: Record<string, AgentType> = {
   gemini: "gemini",
 };
 
-/** Get all descendant PIDs of a process */
-async function getDescendantPids(pid: number): Promise<number[]> {
-  try {
-    // Use pgrep to find all processes with this parent
-    const proc = Bun.spawn(["pgrep", "-P", String(pid)], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const output = await new Response(proc.stdout).text();
-    await proc.exited;
-
-    if (!output.trim()) return [];
-
-    const childPids = output.trim().split("\n").map((p) => parseInt(p, 10)).filter((p) => !isNaN(p));
-    // Recursively get descendants of children
-    const grandchildren = await Promise.all(childPids.map(getDescendantPids));
-    return [...childPids, ...grandchildren.flat()];
-  } catch {
-    return [];
+/** Get all descendant PIDs of a process using in-memory tree */
+function getDescendantsFromTree(pid: number, childrenMap: Map<number, number[]>): number[] {
+  const children = childrenMap.get(pid) || [];
+  const descendants: number[] = [...children];
+  for (const child of children) {
+    descendants.push(...getDescendantsFromTree(child, childrenMap));
   }
+  return descendants;
 }
 
-/** Get CPU/memory stats for a process and all its descendants */
-export async function getProcessStats(pid: number): Promise<ProcessStats | undefined> {
-  try {
-    // Get all descendant PIDs
-    const descendants = await getDescendantPids(pid);
-    const allPids = [pid, ...descendants];
+/** Get stats for multiple PIDs efficiently with a single ps call */
+export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, ProcessStats>> {
+  if (pids.length === 0) return new Map();
 
-    // Get stats for all processes in one call
-    const proc = Bun.spawn(["ps", "-o", "%cpu,%mem,rss", "-p", allPids.join(",")], {
+  try {
+    // Single ps call to get ALL processes with their parent PIDs and stats
+    const proc = Bun.spawn(["ps", "-axo", "pid,ppid,%cpu,%mem,rss"], {
       stdout: "pipe",
       stderr: "pipe",
     });
     const output = await new Response(proc.stdout).text();
     await proc.exited;
 
-    if (proc.exitCode !== 0) return undefined;
+    if (proc.exitCode !== 0) return new Map();
 
-    // Parse output: skip header, sum all values
+    // Build parent->children map and stats map
+    const childrenMap = new Map<number, number[]>();
+    const statsMap = new Map<number, { cpu: number; mem: number; rss: number }>();
+
     const lines = output.trim().split("\n");
-    if (lines.length < 2) return undefined;
-
-    let totalCpu = 0;
-    let totalMem = 0;
-    let totalRss = 0;
-
-    for (let i = 1; i < lines.length; i++) {
+    for (let i = 1; i < lines.length; i++) { // Skip header
       const values = lines[i].trim().split(/\s+/);
-      if (values.length >= 3) {
-        totalCpu += parseFloat(values[0]) || 0;
-        totalMem += parseFloat(values[1]) || 0;
-        totalRss += parseInt(values[2], 10) || 0;
+      if (values.length < 5) continue;
+
+      const pid = parseInt(values[0], 10);
+      const ppid = parseInt(values[1], 10);
+      const cpu = parseFloat(values[2]) || 0;
+      const mem = parseFloat(values[3]) || 0;
+      const rss = parseInt(values[4], 10) || 0;
+
+      if (isNaN(pid)) continue;
+
+      statsMap.set(pid, { cpu, mem, rss });
+
+      if (!isNaN(ppid)) {
+        const siblings = childrenMap.get(ppid) || [];
+        siblings.push(pid);
+        childrenMap.set(ppid, siblings);
       }
     }
 
-    return {
-      pid,
-      cpu: totalCpu,
-      memory: totalMem,
-      rss: totalRss,
-    };
+    // Calculate totals for each requested PID (including descendants)
+    const result = new Map<number, ProcessStats>();
+    const pidSet = new Set(pids);
+
+    for (const pid of pidSet) {
+      const ownStats = statsMap.get(pid);
+      if (!ownStats) continue;
+
+      const descendants = getDescendantsFromTree(pid, childrenMap);
+      let totalCpu = ownStats.cpu;
+      let totalMem = ownStats.mem;
+      let totalRss = ownStats.rss;
+
+      for (const descPid of descendants) {
+        const descStats = statsMap.get(descPid);
+        if (descStats) {
+          totalCpu += descStats.cpu;
+          totalMem += descStats.mem;
+          totalRss += descStats.rss;
+        }
+      }
+
+      result.set(pid, {
+        pid,
+        cpu: totalCpu,
+        memory: totalMem,
+        rss: totalRss,
+      });
+    }
+
+    return result;
   } catch {
-    return undefined;
+    return new Map();
   }
 }
 
-/** Get stats for multiple PIDs in parallel */
-export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, ProcessStats>> {
-  const results = await Promise.all(
-    pids.map(async (pid) => {
-      const stats = await getProcessStats(pid);
-      return [pid, stats] as const;
-    })
-  );
-  const map = new Map<number, ProcessStats>();
-  for (const [pid, stats] of results) {
-    if (stats) map.set(pid, stats);
-  }
-  return map;
+/** Get CPU/memory stats for a process and all its descendants (uses batch internally) */
+export async function getProcessStats(pid: number): Promise<ProcessStats | undefined> {
+  const batch = await getProcessStatsBatch([pid]);
+  return batch.get(pid);
 }
 
 export type DetectedAgent = {
@@ -371,62 +441,87 @@ export type DetectedAgent = {
   command?: string;  // Full command line if available
 };
 
-/** Detect agent type from a pane's process tree */
-export async function detectAgentFromPid(pid: number): Promise<DetectedAgent | undefined> {
-  try {
-    const descendants = await getDescendantPids(pid);
-    const allPids = [pid, ...descendants];
+/** Detect agents for multiple PIDs efficiently with a single ps call */
+export async function detectAgentsBatch(pids: number[]): Promise<Map<number, DetectedAgent>> {
+  if (pids.length === 0) return new Map();
 
-    // Get command names and args for all processes
-    const proc = Bun.spawn(["ps", "-o", "pid,comm,args", "-p", allPids.join(",")], {
+  try {
+    // Single ps call to get ALL processes with their parent PIDs and commands
+    const proc = Bun.spawn(["ps", "-axo", "pid,ppid,comm,args"], {
       stdout: "pipe",
       stderr: "pipe",
     });
     const output = await new Response(proc.stdout).text();
     await proc.exited;
 
-    if (proc.exitCode !== 0) return undefined;
+    if (proc.exitCode !== 0) return new Map();
 
-    // Parse output, skip header
-    const lines = output.trim().split("\n").slice(1);
-    for (const line of lines) {
-      const match = line.trim().match(/^\d+\s+(\S+)\s+(.*)$/);
+    // Build parent->children map and command info map
+    const childrenMap = new Map<number, number[]>();
+    const processInfo = new Map<number, { comm: string; args: string }>();
+
+    const lines = output.trim().split("\n");
+    for (let i = 1; i < lines.length; i++) { // Skip header
+      const match = lines[i].trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
       if (!match) continue;
 
-      const [, comm, args] = match;
-      const commLower = comm.toLowerCase();
+      const [, pidStr, ppidStr, comm, args] = match;
+      const pid = parseInt(pidStr, 10);
+      const ppid = parseInt(ppidStr, 10);
 
-      // Check if this is a known agent binary
-      if (KNOWN_AGENTS[commLower]) {
-        return { agent: KNOWN_AGENTS[commLower], command: args.trim() };
-      }
+      if (isNaN(pid)) continue;
 
-      // Check args for agent names (e.g., "node /path/to/claude")
-      const argsLower = args.toLowerCase();
-      for (const [name, agent] of Object.entries(KNOWN_AGENTS)) {
-        if (argsLower.includes(`/${name}`) || argsLower.includes(` ${name} `)) {
-          return { agent, command: args.trim() };
-        }
+      processInfo.set(pid, { comm, args: args.trim() });
+
+      if (!isNaN(ppid)) {
+        const siblings = childrenMap.get(ppid) || [];
+        siblings.push(pid);
+        childrenMap.set(ppid, siblings);
       }
     }
 
-    return undefined;
+    // Check each requested PID and its descendants for known agents
+    const result = new Map<number, DetectedAgent>();
+    const pidSet = new Set(pids);
+
+    for (const pid of pidSet) {
+      const descendants = getDescendantsFromTree(pid, childrenMap);
+      const allPids = [pid, ...descendants];
+
+      for (const checkPid of allPids) {
+        const info = processInfo.get(checkPid);
+        if (!info) continue;
+
+        const commLower = info.comm.toLowerCase();
+
+        // Check if this is a known agent binary
+        if (KNOWN_AGENTS[commLower]) {
+          result.set(pid, { agent: KNOWN_AGENTS[commLower], command: info.args });
+          break;
+        }
+
+        // Check args for agent names (e.g., "node /path/to/claude")
+        const argsLower = info.args.toLowerCase();
+        let found = false;
+        for (const [name, agent] of Object.entries(KNOWN_AGENTS)) {
+          if (argsLower.includes(`/${name}`) || argsLower.includes(` ${name} `)) {
+            result.set(pid, { agent, command: info.args });
+            found = true;
+            break;
+          }
+        }
+        if (found) break;
+      }
+    }
+
+    return result;
   } catch {
-    return undefined;
+    return new Map();
   }
 }
 
-/** Detect agents for multiple PIDs in parallel */
-export async function detectAgentsBatch(pids: number[]): Promise<Map<number, DetectedAgent>> {
-  const results = await Promise.all(
-    pids.map(async (pid) => {
-      const detected = await detectAgentFromPid(pid);
-      return [pid, detected] as const;
-    })
-  );
-  const map = new Map<number, DetectedAgent>();
-  for (const [pid, detected] of results) {
-    if (detected) map.set(pid, detected);
-  }
-  return map;
+/** Detect agent type from a pane's process tree (uses batch internally) */
+export async function detectAgentFromPid(pid: number): Promise<DetectedAgent | undefined> {
+  const batch = await detectAgentsBatch([pid]);
+  return batch.get(pid);
 }
