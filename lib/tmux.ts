@@ -203,6 +203,15 @@ export async function killSession(sessionName: string): Promise<boolean> {
   return proc.exitCode === 0;
 }
 
+export async function renameSession(oldName: string, newName: string): Promise<boolean> {
+  const proc = Bun.spawn(["tmux", "rename-session", "-t", oldName, newName], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  await proc.exited;
+  return proc.exitCode === 0;
+}
+
 export async function hasSession(sessionName: string): Promise<boolean> {
   const proc = Bun.spawn(["tmux", "has-session", "-t", sessionName], {
     stdout: "pipe",
@@ -268,10 +277,37 @@ export async function capturePanes(
   return new Map(results);
 }
 
-/** Get CPU/memory stats for a process by PID */
+/** Get all descendant PIDs of a process */
+async function getDescendantPids(pid: number): Promise<number[]> {
+  try {
+    // Use pgrep to find all processes with this parent
+    const proc = Bun.spawn(["pgrep", "-P", String(pid)], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const output = await new Response(proc.stdout).text();
+    await proc.exited;
+
+    if (!output.trim()) return [];
+
+    const childPids = output.trim().split("\n").map((p) => parseInt(p, 10)).filter((p) => !isNaN(p));
+    // Recursively get descendants of children
+    const grandchildren = await Promise.all(childPids.map(getDescendantPids));
+    return [...childPids, ...grandchildren.flat()];
+  } catch {
+    return [];
+  }
+}
+
+/** Get CPU/memory stats for a process and all its descendants */
 export async function getProcessStats(pid: number): Promise<ProcessStats | undefined> {
   try {
-    const proc = Bun.spawn(["ps", "-o", "%cpu,%mem,rss", "-p", String(pid)], {
+    // Get all descendant PIDs
+    const descendants = await getDescendantPids(pid);
+    const allPids = [pid, ...descendants];
+
+    // Get stats for all processes in one call
+    const proc = Bun.spawn(["ps", "-o", "%cpu,%mem,rss", "-p", allPids.join(",")], {
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -280,18 +316,28 @@ export async function getProcessStats(pid: number): Promise<ProcessStats | undef
 
     if (proc.exitCode !== 0) return undefined;
 
-    // Parse output: skip header, get values
+    // Parse output: skip header, sum all values
     const lines = output.trim().split("\n");
     if (lines.length < 2) return undefined;
 
-    const values = lines[1].trim().split(/\s+/);
-    if (values.length < 3) return undefined;
+    let totalCpu = 0;
+    let totalMem = 0;
+    let totalRss = 0;
+
+    for (let i = 1; i < lines.length; i++) {
+      const values = lines[i].trim().split(/\s+/);
+      if (values.length >= 3) {
+        totalCpu += parseFloat(values[0]) || 0;
+        totalMem += parseFloat(values[1]) || 0;
+        totalRss += parseInt(values[2], 10) || 0;
+      }
+    }
 
     return {
       pid,
-      cpu: parseFloat(values[0]) || 0,
-      memory: parseFloat(values[1]) || 0,
-      rss: parseInt(values[2], 10) || 0,
+      cpu: totalCpu,
+      memory: totalMem,
+      rss: totalRss,
     };
   } catch {
     return undefined;
