@@ -5,9 +5,11 @@ import {
   listSessions,
   capturePanes,
   getProcessStatsBatch,
+  detectAgentsBatch,
   killSession,
   renameSession,
   hasSession,
+  type DetectedAgent,
 } from "./lib/tmux";
 import { createId } from "./lib/ids";
 import { appendJsonl, readJsonlTail, expandHome } from "./lib/jsonl";
@@ -264,10 +266,41 @@ function formatSessionMeta(meta: SessionMetaEntry | undefined): string | undefin
   return combined.length > 0 ? combined : undefined;
 }
 
+// Color for each agent type
+const AGENT_COLORS: Record<string, string> = {
+  claude: ANSI.magenta,
+  codex: ANSI.cyan,
+  gemini: ANSI.yellow,
+};
+
+function getSessionAgent(
+  session: TmuxSessionInfo,
+  meta: SessionMetaEntry | undefined,
+  detectedAgents: Map<number, DetectedAgent>,
+  agentsOnly: boolean
+): string | undefined {
+  // Priority 1: metadata from launch.ts
+  if (meta?.agent) return meta.agent;
+
+  // Priority 2: detect from process tree
+  const windows = getFilteredWindows(session, agentsOnly);
+  for (const window of windows) {
+    for (const pane of window.panes) {
+      if (pane.panePid) {
+        const detected = detectedAgents.get(pane.panePid);
+        if (detected) return detected.agent;
+      }
+    }
+  }
+
+  return undefined;
+}
+
 function renderSessions(
   state: WatchState,
   capturedLines: Map<string, string | undefined>,
   processStats: Map<number, ProcessStats>,
+  detectedAgents: Map<number, DetectedAgent>,
   maxLines: number
 ): string {
   const { showLastLine, showStats, selectedIndex, filter, agentsOnly, expandAll } = state;
@@ -307,28 +340,28 @@ function renderSessions(
     const durationStr = durationSec > 0 ? `${ANSI.dim}${formatDuration(durationSec)}${ANSI.reset}` : "";
     const statusBadge = meta?.status === "done" ? `${ANSI.dim}[done]${ANSI.reset}` : "";
 
+    // Detect agent for this session
+    const agentName = getSessionAgent(session, meta, detectedAgents, agentsOnly);
+    const agentColor = agentName ? (AGENT_COLORS[agentName] || ANSI.blue) : "";
+    const agentBadge = agentName ? `${agentColor}[${agentName}]${ANSI.reset}` : "";
+
     const selectMark = isSelected ? `${ANSI.inverse}►${ANSI.reset}` : " ";
     const namePart = isSelected
       ? `${ANSI.bold}${ANSI.yellow}${session.name}${ANSI.reset}`
       : `${ANSI.bold}${session.name}${ANSI.reset}`;
 
-    // Collapsed: show summary (pane count or agent names)
+    // Collapsed: show summary with agent badge
     if (!isExpanded) {
-      const totalPanes = filteredWindows.reduce((sum, w) => sum + w.panes.length, 0);
-      const agentCount = countAgentPanes(session);
-      const summary = agentsOnly || agentCount > 0
-        ? `${ANSI.dim}${agentCount} agent${agentCount !== 1 ? "s" : ""}${ANSI.reset}`
-        : `${ANSI.dim}${totalPanes}p${ANSI.reset}`;
       const lineIndex = lines.length - contentStart;
       if (isSelected) selectedLineIndex = lineIndex;
-      lines.push(`${selectMark}${attachIcon} ${namePart} ${durationStr}${statusBadge ? ` ${statusBadge}` : ""} ${summary}`);
+      lines.push(`${selectMark}${attachIcon} ${namePart} ${agentBadge} ${durationStr}${statusBadge ? ` ${statusBadge}` : ""}`.trimEnd());
       continue;
     }
 
-    // Expanded: show full details
+    // Expanded: show full details with agent badge
     const lineIndex = lines.length - contentStart;
     if (isSelected) selectedLineIndex = lineIndex;
-    lines.push(`${selectMark}${attachIcon} ${namePart} ${durationStr}${statusBadge ? ` ${statusBadge}` : ""}`.trimEnd());
+    lines.push(`${selectMark}${attachIcon} ${namePart} ${agentBadge} ${durationStr}${statusBadge ? ` ${statusBadge}` : ""}`.trimEnd());
 
     const metaLine = formatSessionMeta(meta);
     if (metaLine) {
@@ -347,7 +380,14 @@ function renderSessions(
         const paneActive = pane.active ? `${ANSI.green}›${ANSI.reset}` : " ";
         const cmdStr = pane.command ? `${ANSI.blue}${pane.command}${ANSI.reset}` : "";
         const statsStr = showStats && pane.panePid ? ` ${formatStats(processStats.get(pane.panePid))}` : "";
-        lines.push(`${indent}${paneActive}${cmdStr}${statsStr}`);
+
+        // Show detected agent for this specific pane if different from session agent
+        const paneDetected = pane.panePid ? detectedAgents.get(pane.panePid) : undefined;
+        const paneAgentStr = paneDetected && paneDetected.agent !== agentName
+          ? ` ${AGENT_COLORS[paneDetected.agent] || ANSI.blue}(${paneDetected.agent})${ANSI.reset}`
+          : "";
+
+        lines.push(`${indent}${paneActive}${cmdStr}${paneAgentStr}${statsStr}`);
 
         if (showLastLine) {
           const target = `${session.name}:${window.index}.${pane.paneIndex}`;
@@ -463,13 +503,22 @@ async function renderDisplay(state: WatchState): Promise<string> {
   // Collect pane data (only for expanded sessions to save resources)
   const paneTargets: string[] = [];
   const panePids: number[] = [];
+  const allPanePids: number[] = [];  // For agent detection on all sessions
 
   for (let i = 0; i < sessions.length; i++) {
     const session = sessions[i];
     const isExpanded = expandAll || i === state.selectedIndex;
-    if (!isExpanded) continue;  // Skip collapsed sessions
-
     const windows = getFilteredWindows(session, agentsOnly);
+
+    // Collect PIDs for all sessions (for agent detection)
+    for (const window of windows) {
+      for (const pane of window.panes) {
+        if (pane.panePid) allPanePids.push(pane.panePid);
+      }
+    }
+
+    if (!isExpanded) continue;  // Skip collapsed sessions for detailed data
+
     for (const window of windows) {
       for (const pane of window.panes) {
         if (showLastLine) {
@@ -482,12 +531,13 @@ async function renderDisplay(state: WatchState): Promise<string> {
     }
   }
 
-  const [capturedLines, processStats] = await Promise.all([
+  const [capturedLines, processStats, detectedAgents] = await Promise.all([
     showLastLine ? capturePanes(paneTargets) : Promise.resolve(new Map<string, string | undefined>()),
     showStats ? getProcessStatsBatch(panePids) : Promise.resolve(new Map<number, ProcessStats>()),
+    detectAgentsBatch(allPanePids),
   ]);
 
-  const sessionsContent = renderSessions(state, capturedLines, processStats, maxSessionLines);
+  const sessionsContent = renderSessions(state, capturedLines, processStats, detectedAgents, maxSessionLines);
 
   if (showHooks && state.hooksEnabled) {
     const hooksContent = renderHooks(state);

@@ -277,6 +277,13 @@ export async function capturePanes(
   return new Map(results);
 }
 
+/** Known agent binary names for detection */
+const KNOWN_AGENTS: Record<string, AgentType> = {
+  claude: "claude",
+  codex: "codex",
+  gemini: "gemini",
+};
+
 /** Get all descendant PIDs of a process */
 async function getDescendantPids(pid: number): Promise<number[]> {
   try {
@@ -355,6 +362,71 @@ export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, 
   const map = new Map<number, ProcessStats>();
   for (const [pid, stats] of results) {
     if (stats) map.set(pid, stats);
+  }
+  return map;
+}
+
+export type DetectedAgent = {
+  agent: AgentType;
+  command?: string;  // Full command line if available
+};
+
+/** Detect agent type from a pane's process tree */
+export async function detectAgentFromPid(pid: number): Promise<DetectedAgent | undefined> {
+  try {
+    const descendants = await getDescendantPids(pid);
+    const allPids = [pid, ...descendants];
+
+    // Get command names and args for all processes
+    const proc = Bun.spawn(["ps", "-o", "pid,comm,args", "-p", allPids.join(",")], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const output = await new Response(proc.stdout).text();
+    await proc.exited;
+
+    if (proc.exitCode !== 0) return undefined;
+
+    // Parse output, skip header
+    const lines = output.trim().split("\n").slice(1);
+    for (const line of lines) {
+      const match = line.trim().match(/^\d+\s+(\S+)\s+(.*)$/);
+      if (!match) continue;
+
+      const [, comm, args] = match;
+      const commLower = comm.toLowerCase();
+
+      // Check if this is a known agent binary
+      if (KNOWN_AGENTS[commLower]) {
+        return { agent: KNOWN_AGENTS[commLower], command: args.trim() };
+      }
+
+      // Check args for agent names (e.g., "node /path/to/claude")
+      const argsLower = args.toLowerCase();
+      for (const [name, agent] of Object.entries(KNOWN_AGENTS)) {
+        if (argsLower.includes(`/${name}`) || argsLower.includes(` ${name} `)) {
+          return { agent, command: args.trim() };
+        }
+      }
+    }
+
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Detect agents for multiple PIDs in parallel */
+export async function detectAgentsBatch(pids: number[]): Promise<Map<number, DetectedAgent>> {
+  const results = await Promise.all(
+    pids.map(async (pid) => {
+      const detected = await detectAgentFromPid(pid);
+      return [pid, detected] as const;
+    })
+  );
+  const map = new Map<number, DetectedAgent>();
+  for (const [pid, detected] of results) {
+    if (detected) map.set(pid, detected);
   }
   return map;
 }
