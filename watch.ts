@@ -793,7 +793,8 @@ async function main() {
       interval: { type: "string", short: "i", default: "2000" },
       "no-last-line": { type: "boolean" },
       "no-stats": { type: "boolean" },
-      "agents-only": { type: "boolean", short: "a" },
+      all: { type: "boolean", short: "A" },  // show all sessions, not just agents
+      "no-expand": { type: "boolean" },      // collapse sessions by default
       sort: { type: "string" },
       hooks: { type: "boolean", default: true },
       "hooks-port": { type: "string", default: String(DEFAULT_HOOKS_PORT) },
@@ -819,7 +820,8 @@ Usage:
 Options:
   -f, --filter        Filter sessions by prefix (e.g., awm)
   -i, --interval      Refresh interval in ms (default: 2000)
-  -a, --agents-only   Only show panes running agents (claude/codex/gemini)
+  -A, --all           Show all sessions (default: agents only)
+  --no-expand         Collapse sessions (default: all expanded)
   --sort              Sort sessions: name, created, activity
   --no-last-line      Hide pane output (shown by default)
   --no-stats          Hide CPU/memory stats (shown by default)
@@ -853,8 +855,10 @@ Interactive Keybindings:
   q         Quit
 
 Examples:
-  bun run watch.ts --filter awm
-  bun run watch.ts --filter awm --agents-only
+  bun run watch.ts                          # agents only, all expanded
+  bun run watch.ts --filter awm             # filter to awm prefix
+  bun run watch.ts --all                    # show all sessions
+  bun run watch.ts --no-expand              # collapse sessions
   bun run watch.ts --no-stats --no-last-line
   bun run watch.ts --hooks-daemon
 `);
@@ -880,8 +884,8 @@ Examples:
     showStats: !values["no-stats"],          // ON by default
     showHelp: false,
     showHooks: hooksEnabled,
-    agentsOnly: values["agents-only"] ?? false,
-    expandAll: false,  // collapsed by default, only selected expanded
+    agentsOnly: !values.all,       // ON by default (filter to agents), --all or -A to show all
+    expandAll: !values["no-expand"],  // ON by default (all expanded), --no-expand to collapse
     sortBy,
     selectedIndex: 0,
     scrollOffset: 0,
