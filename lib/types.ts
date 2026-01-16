@@ -1,12 +1,5 @@
 export type AgentType = "claude" | "codex" | "gemini";
 
-export type LaunchConfig = {
-  prompt: string;
-  agents: AgentType[];
-  cwd?: string;
-  sessionPrefix?: string;
-};
-
 export type LaunchedSession = {
   id: string;
   agent: AgentType;
@@ -63,13 +56,6 @@ export type TmuxSessionInfo = {
   windowList: TmuxWindowInfo[];
 };
 
-export type WatchOptions = {
-  filter?: string;
-  refreshIntervalMs?: number;
-  showLastLine?: boolean;
-  tui?: boolean;
-};
-
 export type HookEntry = {
   id: string;
   timestamp: string;
@@ -77,16 +63,26 @@ export type HookEntry = {
   payload: Record<string, unknown>;
 };
 
+export type SessionMetaEntry = {
+  id: string;
+  timestamp: string;
+  sessionName: string;
+  agent?: AgentType;
+  promptPreview?: string;
+  cwd?: string;
+  tag?: string;
+  planId?: string;
+  taskId?: string;
+  status?: "running" | "done";
+  renamedFrom?: string;
+  source?: "launch" | "orchestrate" | "watch";
+};
+
 export type ProcessStats = {
   pid: number;
   cpu: number;     // percentage
   memory: number;  // percentage
   rss: number;     // KB
-};
-
-export type HooksConfig = {
-  port: number;
-  dataDir: string;
 };
 
 export type AgentConfig = {
@@ -108,13 +104,6 @@ export const AGENT_CONFIGS: Record<AgentType, AgentConfig> = {
     command: "gemini",
     defaultFlags: [], // Could add "--yolo" here for auto-approval
   },
-};
-
-// Legacy compat
-export const AGENT_COMMANDS: Record<AgentType, string[]> = {
-  claude: ["claude"],
-  codex: ["codex"],
-  gemini: ["gemini"],
 };
 
 export const DEFAULT_SESSION_PREFIX = "awm";

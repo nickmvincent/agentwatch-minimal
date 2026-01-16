@@ -1,7 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { createId, createSessionName } from "../lib/ids";
 import { expandHome } from "../lib/jsonl";
-import { AGENT_COMMANDS, DEFAULT_SESSION_PREFIX, DEFAULT_HOOKS_PORT } from "../lib/types";
+import { DEFAULT_SESSION_PREFIX, DEFAULT_HOOKS_PORT } from "../lib/types";
 import { homedir } from "os";
 
 describe("ids", () => {
@@ -51,12 +51,6 @@ describe("jsonl", () => {
 });
 
 describe("types", () => {
-  test("AGENT_COMMANDS has all three agents", () => {
-    expect(AGENT_COMMANDS.claude).toEqual(["claude"]);
-    expect(AGENT_COMMANDS.codex).toEqual(["codex"]);
-    expect(AGENT_COMMANDS.gemini).toEqual(["gemini"]);
-  });
-
   test("DEFAULT_SESSION_PREFIX is awm", () => {
     expect(DEFAULT_SESSION_PREFIX).toBe("awm");
   });

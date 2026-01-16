@@ -6,7 +6,6 @@
     "launch": "bun run launch.ts",
     "orchestrate": "bun run orchestrate.ts",
     "watch": "bun run watch.ts",
-    "hooks": "bun run hooks.ts",
     "test": "bun test"
   },
   "dependencies": {
