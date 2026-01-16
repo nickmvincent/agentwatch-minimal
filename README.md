@@ -161,8 +161,9 @@ bun run watch.ts [options]
 |------|-------|---------|-------------|
 | `--filter` | `-f` | (none) | Filter sessions by name prefix |
 | `--interval` | `-i` | `2000` | Refresh interval in milliseconds |
-| `--last-line` | `-l` | `false` | Show last line of output from each pane |
-| `--stats` | `-s` | `false` | Show CPU/memory stats for each pane |
+| `--agents-only` | `-a` | `false` | Only show panes running agents |
+| `--no-last-line` | | `false` | Hide pane output (shown by default) |
+| `--no-stats` | | `false` | Hide CPU/memory stats (shown by default) |
 | `--hooks-port` | | `8750` | Hooks server port |
 | `--no-hooks` | | `false` | Disable embedded hooks server |
 | `--hooks-daemon` | | `false` | Run only hooks server (no TUI) |
@@ -183,6 +184,7 @@ bun run watch.ts [options]
 | `x` | Kill selected session |
 | `l` | Toggle last-line display |
 | `s` | Toggle stats display |
+| `f` | Toggle agents-only filter |
 | `h` | Toggle hooks panel |
 | `r` | Refresh now |
 | `?` | Toggle help |
@@ -191,14 +193,14 @@ bun run watch.ts [options]
 **Examples:**
 
 ```bash
-# Watch sessions with hooks panel (default)
+# Watch sessions (stats + output shown by default)
 bun run watch.ts --filter awm
 
-# With stats and last-line enabled
-bun run watch.ts --filter awm --last-line --stats
+# Only show agent panes (filter out shells)
+bun run watch.ts --filter awm --agents-only
 
-# Sessions only (no hooks server)
-bun run watch.ts --filter awm --no-hooks
+# Minimal view (no stats, no output)
+bun run watch.ts --filter awm --no-stats --no-last-line
 
 # Hooks server only (daemon mode, no TUI)
 bun run watch.ts --hooks-daemon

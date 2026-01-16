@@ -32,6 +32,14 @@ const EVENT_COLORS: Record<string, string> = {
   "error": ANSI.red,
 };
 
+// Known agent process names
+const AGENT_COMMANDS = new Set(["claude", "codex", "gemini", "node", "bun"]);
+
+function isAgentCommand(cmd: string | undefined): boolean {
+  if (!cmd) return false;
+  return AGENT_COMMANDS.has(cmd.toLowerCase());
+}
+
 // State for the unified TUI
 type WatchState = {
   filter: string | undefined;
@@ -40,6 +48,7 @@ type WatchState = {
   showStats: boolean;
   showHelp: boolean;
   showHooks: boolean;
+  agentsOnly: boolean;
   selectedIndex: number;
   sessions: TmuxSessionInfo[];
   recentHooks: HookEntry[];
@@ -120,16 +129,16 @@ ${ANSI.dim}${"─".repeat(50)}${ANSI.reset}
   ${ANSI.cyan}Navigation${ANSI.reset}
   j/↓      Move selection down
   k/↑      Move selection up
-  Enter    Attach to selected session
+  Enter/a  Attach to selected session
 
   ${ANSI.cyan}Display${ANSI.reset}
-  l        Toggle last line display
+  l        Toggle last line output
   s        Toggle CPU/memory stats
+  f        Toggle agents-only filter
   h        Toggle hooks panel
   r        Refresh now
 
   ${ANSI.cyan}Actions${ANSI.reset}
-  a        Attach to selected session
   x        Kill selected session
 
   ${ANSI.cyan}General${ANSI.reset}
@@ -175,12 +184,13 @@ function renderTwoColumn(state: WatchState, leftContent: string, rightContent: s
 }
 
 function renderSessions(state: WatchState, capturedLines: Map<string, string | undefined>, processStats: Map<number, ProcessStats>): string {
-  const { sessions, showLastLine, showStats, selectedIndex, filter } = state;
+  const { sessions, showLastLine, showStats, selectedIndex, filter, agentsOnly } = state;
   const now = Math.floor(Date.now() / 1000);
 
   let output = "";
   output += `${ANSI.bold}Sessions${ANSI.reset}`;
   if (filter) output += ` ${ANSI.dim}(${filter})${ANSI.reset}`;
+  if (agentsOnly) output += ` ${ANSI.magenta}[agents]${ANSI.reset}`;
   output += `\n${ANSI.dim}${"─".repeat(35)}${ANSI.reset}\n`;
 
   if (sessions.length === 0) {
@@ -191,35 +201,52 @@ function renderSessions(state: WatchState, capturedLines: Map<string, string | u
   for (let i = 0; i < sessions.length; i++) {
     const session = sessions[i];
     const isSelected = i === selectedIndex;
+
+    // Filter panes to only agents if agentsOnly is set
+    const filteredWindows = agentsOnly
+      ? session.windowList.map(w => ({
+          ...w,
+          panes: w.panes.filter(p => isAgentCommand(p.command))
+        })).filter(w => w.panes.length > 0)
+      : session.windowList;
+
+    // Skip session entirely if no matching panes
+    if (agentsOnly && filteredWindows.length === 0) continue;
+
     const attachIcon = session.attached ? `${ANSI.green}●${ANSI.reset}` : `${ANSI.dim}○${ANSI.reset}`;
     const durationSec = session.created ? now - session.created : 0;
-    const durationStr = durationSec > 0 ? `${ANSI.dim}(${formatDuration(durationSec)})${ANSI.reset}` : "";
+    const durationStr = durationSec > 0 ? `${ANSI.dim}${formatDuration(durationSec)}${ANSI.reset}` : "";
 
-    const selectMark = isSelected ? `${ANSI.inverse} ► ${ANSI.reset}` : "   ";
+    const selectMark = isSelected ? `${ANSI.inverse}►${ANSI.reset}` : " ";
     const namePart = isSelected
       ? `${ANSI.bold}${ANSI.yellow}${session.name}${ANSI.reset}`
       : `${ANSI.bold}${session.name}${ANSI.reset}`;
 
     output += `${selectMark}${attachIcon} ${namePart} ${durationStr}\n`;
 
-    for (const window of session.windowList) {
-      const windowActive = window.active ? `${ANSI.yellow}*${ANSI.reset}` : " ";
-      output += `     ${windowActive} ${window.index}:${ANSI.cyan}${window.name}${ANSI.reset}`;
-      output += ` ${ANSI.dim}(${window.panes.length}p)${ANSI.reset}\n`;
+    for (const window of filteredWindows) {
+      // Compact: skip window line if only 1 window with 1 pane
+      const showWindowLine = session.windowList.length > 1 || window.panes.length > 1;
+      if (showWindowLine) {
+        const windowActive = window.active ? `${ANSI.yellow}*${ANSI.reset}` : " ";
+        output += `   ${windowActive}${window.index}:${ANSI.cyan}${window.name}${ANSI.reset}\n`;
+      }
 
       for (const pane of window.panes) {
-        const paneActive = pane.active ? `${ANSI.green}>${ANSI.reset}` : " ";
+        const indent = showWindowLine ? "    " : "  ";
+        const paneActive = pane.active ? `${ANSI.green}›${ANSI.reset}` : " ";
         const cmdStr = pane.command ? `${ANSI.blue}${pane.command}${ANSI.reset}` : "";
-        const statsStr = showStats && pane.panePid ? formatStats(processStats.get(pane.panePid)) : "";
+        const statsStr = showStats && pane.panePid ? ` ${formatStats(processStats.get(pane.panePid))}` : "";
 
-        output += `       ${paneActive} ${pane.paneIndex}: ${cmdStr} ${statsStr}\n`;
+        // Compact: command + stats on same line
+        output += `${indent}${paneActive}${cmdStr}${statsStr}\n`;
 
         if (showLastLine) {
           const target = `${session.name}:${window.index}.${pane.paneIndex}`;
           const lastLine = capturedLines.get(target);
           if (lastLine) {
-            const truncated = lastLine.slice(0, 30);
-            output += `         ${ANSI.dim}${truncated}${lastLine.length > 30 ? "…" : ""}${ANSI.reset}\n`;
+            const truncated = lastLine.slice(0, 38);
+            output += `${indent} ${ANSI.dim}${truncated}${lastLine.length > 38 ? "…" : ""}${ANSI.reset}\n`;
           }
         }
       }
@@ -260,14 +287,14 @@ function renderHooks(state: WatchState): string {
 }
 
 async function renderDisplay(state: WatchState): Promise<string> {
-  const { sessions, showLastLine, showStats, showHelp, showHooks, filter } = state;
+  const { sessions, showLastLine, showStats, showHelp, showHooks, agentsOnly } = state;
 
   if (showHelp) {
     return renderHelp();
   }
 
   let output = "";
-  const now = new Date().toLocaleTimeString();
+  const now = new Date().toLocaleTimeString("en-US", { hour12: false });
 
   // Header
   output += `${ANSI.bold}agentwatch${ANSI.reset} ${ANSI.dim}${now}${ANSI.reset}\n`;
@@ -276,9 +303,10 @@ async function renderDisplay(state: WatchState): Promise<string> {
   const indicators = [];
   if (showLastLine) indicators.push(`${ANSI.green}L${ANSI.reset}`);
   if (showStats) indicators.push(`${ANSI.green}S${ANSI.reset}`);
+  if (agentsOnly) indicators.push(`${ANSI.magenta}F${ANSI.reset}`);
   if (showHooks) indicators.push(`${ANSI.green}H${ANSI.reset}`);
 
-  output += `${ANSI.dim}[${indicators.join(" ")}] l:line s:stats h:hooks ?:help q:quit${ANSI.reset}\n`;
+  output += `${ANSI.dim}[${indicators.join("")}] l:line s:stats f:filter h:hooks ?:help q:quit${ANSI.reset}\n`;
   output += `${ANSI.dim}${"─".repeat(70)}${ANSI.reset}\n\n`;
 
   // Collect pane data
@@ -433,6 +461,9 @@ async function interactiveLoop(state: WatchState): Promise<void> {
     } else if (key === "h") {
       state.showHooks = !state.showHooks;
       needsRefresh = true;
+    } else if (key === "f") {
+      state.agentsOnly = !state.agentsOnly;
+      needsRefresh = true;
     } else if (key === "r") {
       needsRefresh = true;
     } else if ((key === "\r" || key === "\n" || key === "a") && state.sessions.length > 0) {
@@ -526,8 +557,9 @@ async function main() {
     options: {
       filter: { type: "string", short: "f" },
       interval: { type: "string", short: "i", default: "2000" },
-      "last-line": { type: "boolean", short: "l" },
-      stats: { type: "boolean", short: "s" },
+      "no-last-line": { type: "boolean" },
+      "no-stats": { type: "boolean" },
+      "agents-only": { type: "boolean", short: "a" },
       hooks: { type: "boolean", default: true },
       "hooks-port": { type: "string", default: String(DEFAULT_HOOKS_PORT) },
       "hooks-daemon": { type: "boolean" },
@@ -551,8 +583,9 @@ Usage:
 Options:
   -f, --filter        Filter sessions by prefix (e.g., awm)
   -i, --interval      Refresh interval in ms (default: 2000)
-  -l, --last-line     Show last line of each pane
-  -s, --stats         Show CPU/memory stats for each pane
+  -a, --agents-only   Only show panes running agents (claude/codex/gemini)
+  --no-last-line      Hide pane output (shown by default)
+  --no-stats          Hide CPU/memory stats (shown by default)
 
   --hooks-port        Hooks server port (default: ${DEFAULT_HOOKS_PORT})
   --no-hooks          Disable embedded hooks server
@@ -574,6 +607,7 @@ Interactive Keybindings:
   x         Kill selected session
   l         Toggle last-line display
   s         Toggle stats display
+  f         Toggle agents-only filter
   h         Toggle hooks panel
   r         Refresh now
   ?         Toggle help
@@ -581,9 +615,9 @@ Interactive Keybindings:
 
 Examples:
   bun run watch.ts --filter awm
-  bun run watch.ts --filter awm --last-line --stats
+  bun run watch.ts --filter awm --agents-only
+  bun run watch.ts --no-stats --no-last-line
   bun run watch.ts --hooks-daemon
-  bun run watch.ts --no-hooks
 `);
     process.exit(0);
   }
@@ -595,10 +629,11 @@ Examples:
   const state: WatchState = {
     filter: values.filter,
     intervalMs: parseInt(values.interval!, 10),
-    showLastLine: values["last-line"] ?? false,
-    showStats: values.stats ?? false,
+    showLastLine: !values["no-last-line"],  // ON by default
+    showStats: !values["no-stats"],          // ON by default
     showHelp: false,
     showHooks: hooksEnabled,
+    agentsOnly: values["agents-only"] ?? false,
     selectedIndex: 0,
     sessions: [],
     recentHooks: [],
