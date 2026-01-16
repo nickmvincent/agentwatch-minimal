@@ -49,7 +49,9 @@ type WatchState = {
   showHelp: boolean;
   showHooks: boolean;
   agentsOnly: boolean;
+  expandAll: boolean;  // false = only selected session expanded
   selectedIndex: number;
+  scrollOffset: number;  // for viewport scrolling
   sessions: TmuxSessionInfo[];
   recentHooks: HookEntry[];
   hooksPort: number;
@@ -135,6 +137,7 @@ ${ANSI.dim}${"─".repeat(50)}${ANSI.reset}
   l        Toggle last line output
   s        Toggle CPU/memory stats
   f        Toggle agents-only filter
+  e        Toggle expand all sessions
   h        Toggle hooks panel
   r        Refresh now
 
@@ -183,35 +186,54 @@ function renderTwoColumn(state: WatchState, leftContent: string, rightContent: s
   return output;
 }
 
-function renderSessions(state: WatchState, capturedLines: Map<string, string | undefined>, processStats: Map<number, ProcessStats>): string {
-  const { sessions, showLastLine, showStats, selectedIndex, filter, agentsOnly } = state;
+function getFilteredWindows(session: TmuxSessionInfo, agentsOnly: boolean) {
+  if (!agentsOnly) return session.windowList;
+  return session.windowList
+    .map(w => ({ ...w, panes: w.panes.filter(p => isAgentCommand(p.command)) }))
+    .filter(w => w.panes.length > 0);
+}
+
+function countAgentPanes(session: TmuxSessionInfo): number {
+  return session.windowList.reduce((sum, w) =>
+    sum + w.panes.filter(p => isAgentCommand(p.command)).length, 0);
+}
+
+function renderSessions(
+  state: WatchState,
+  capturedLines: Map<string, string | undefined>,
+  processStats: Map<number, ProcessStats>,
+  maxLines: number
+): string {
+  const { sessions, showLastLine, showStats, selectedIndex, filter, agentsOnly, expandAll, scrollOffset } = state;
   const now = Math.floor(Date.now() / 1000);
 
-  let output = "";
-  output += `${ANSI.bold}Sessions${ANSI.reset}`;
-  if (filter) output += ` ${ANSI.dim}(${filter})${ANSI.reset}`;
-  if (agentsOnly) output += ` ${ANSI.magenta}[agents]${ANSI.reset}`;
-  output += `\n${ANSI.dim}${"─".repeat(35)}${ANSI.reset}\n`;
+  const lines: string[] = [];
+
+  // Header
+  let header = `${ANSI.bold}Sessions${ANSI.reset}`;
+  if (filter) header += ` ${ANSI.dim}(${filter})${ANSI.reset}`;
+  if (agentsOnly) header += ` ${ANSI.magenta}[agents]${ANSI.reset}`;
+  if (!expandAll) header += ` ${ANSI.dim}[collapsed]${ANSI.reset}`;
+  lines.push(header);
+  lines.push(`${ANSI.dim}${"─".repeat(35)}${ANSI.reset}`);
 
   if (sessions.length === 0) {
-    output += `${ANSI.dim}No sessions found${ANSI.reset}\n`;
-    return output;
+    lines.push(`${ANSI.dim}No sessions found${ANSI.reset}`);
+    return lines.join("\n") + "\n";
   }
 
+  // Build session entries
+  let visibleIndex = -1;  // Track visible sessions after filtering
   for (let i = 0; i < sessions.length; i++) {
     const session = sessions[i];
-    const isSelected = i === selectedIndex;
+    const filteredWindows = getFilteredWindows(session, agentsOnly);
 
-    // Filter panes to only agents if agentsOnly is set
-    const filteredWindows = agentsOnly
-      ? session.windowList.map(w => ({
-          ...w,
-          panes: w.panes.filter(p => isAgentCommand(p.command))
-        })).filter(w => w.panes.length > 0)
-      : session.windowList;
-
-    // Skip session entirely if no matching panes
+    // Skip session entirely if no matching panes in agents-only mode
     if (agentsOnly && filteredWindows.length === 0) continue;
+
+    visibleIndex++;
+    const isSelected = i === selectedIndex;
+    const isExpanded = expandAll || isSelected;
 
     const attachIcon = session.attached ? `${ANSI.green}●${ANSI.reset}` : `${ANSI.dim}○${ANSI.reset}`;
     const durationSec = session.created ? now - session.created : 0;
@@ -222,14 +244,25 @@ function renderSessions(state: WatchState, capturedLines: Map<string, string | u
       ? `${ANSI.bold}${ANSI.yellow}${session.name}${ANSI.reset}`
       : `${ANSI.bold}${session.name}${ANSI.reset}`;
 
-    output += `${selectMark}${attachIcon} ${namePart} ${durationStr}\n`;
+    // Collapsed: show summary (pane count or agent names)
+    if (!isExpanded) {
+      const totalPanes = filteredWindows.reduce((sum, w) => sum + w.panes.length, 0);
+      const agentCount = countAgentPanes(session);
+      const summary = agentsOnly || agentCount > 0
+        ? `${ANSI.dim}${agentCount} agent${agentCount !== 1 ? "s" : ""}${ANSI.reset}`
+        : `${ANSI.dim}${totalPanes}p${ANSI.reset}`;
+      lines.push(`${selectMark}${attachIcon} ${namePart} ${durationStr} ${summary}`);
+      continue;
+    }
+
+    // Expanded: show full details
+    lines.push(`${selectMark}${attachIcon} ${namePart} ${durationStr}`);
 
     for (const window of filteredWindows) {
-      // Compact: skip window line if only 1 window with 1 pane
-      const showWindowLine = session.windowList.length > 1 || window.panes.length > 1;
+      const showWindowLine = filteredWindows.length > 1 || window.panes.length > 1;
       if (showWindowLine) {
         const windowActive = window.active ? `${ANSI.yellow}*${ANSI.reset}` : " ";
-        output += `   ${windowActive}${window.index}:${ANSI.cyan}${window.name}${ANSI.reset}\n`;
+        lines.push(`   ${windowActive}${window.index}:${ANSI.cyan}${window.name}${ANSI.reset}`);
       }
 
       for (const pane of window.panes) {
@@ -237,23 +270,39 @@ function renderSessions(state: WatchState, capturedLines: Map<string, string | u
         const paneActive = pane.active ? `${ANSI.green}›${ANSI.reset}` : " ";
         const cmdStr = pane.command ? `${ANSI.blue}${pane.command}${ANSI.reset}` : "";
         const statsStr = showStats && pane.panePid ? ` ${formatStats(processStats.get(pane.panePid))}` : "";
-
-        // Compact: command + stats on same line
-        output += `${indent}${paneActive}${cmdStr}${statsStr}\n`;
+        lines.push(`${indent}${paneActive}${cmdStr}${statsStr}`);
 
         if (showLastLine) {
           const target = `${session.name}:${window.index}.${pane.paneIndex}`;
           const lastLine = capturedLines.get(target);
           if (lastLine) {
             const truncated = lastLine.slice(0, 38);
-            output += `${indent} ${ANSI.dim}${truncated}${lastLine.length > 38 ? "…" : ""}${ANSI.reset}\n`;
+            lines.push(`${indent} ${ANSI.dim}${truncated}${lastLine.length > 38 ? "…" : ""}${ANSI.reset}`);
           }
         }
       }
     }
   }
 
-  return output;
+  // Apply viewport scrolling if content exceeds maxLines
+  const contentLines = lines.slice(2);  // Skip header
+  if (contentLines.length <= maxLines) {
+    return lines.join("\n") + "\n";
+  }
+
+  // Scroll to keep selection visible
+  const visibleContent = contentLines.slice(scrollOffset, scrollOffset + maxLines);
+  const scrollIndicator = scrollOffset > 0 ? `${ANSI.dim}↑ more${ANSI.reset}` : "";
+  const moreBelow = scrollOffset + maxLines < contentLines.length
+    ? `${ANSI.dim}↓ ${contentLines.length - scrollOffset - maxLines} more${ANSI.reset}`
+    : "";
+
+  const result = [lines[0], lines[1]];
+  if (scrollIndicator) result.push(scrollIndicator);
+  result.push(...visibleContent);
+  if (moreBelow) result.push(moreBelow);
+
+  return result.join("\n") + "\n";
 }
 
 function renderHooks(state: WatchState): string {
@@ -287,7 +336,7 @@ function renderHooks(state: WatchState): string {
 }
 
 async function renderDisplay(state: WatchState): Promise<string> {
-  const { sessions, showLastLine, showStats, showHelp, showHooks, agentsOnly } = state;
+  const { sessions, showLastLine, showStats, showHelp, showHooks, agentsOnly, expandAll } = state;
 
   if (showHelp) {
     return renderHelp();
@@ -295,6 +344,14 @@ async function renderDisplay(state: WatchState): Promise<string> {
 
   let output = "";
   const now = new Date().toLocaleTimeString("en-US", { hour12: false });
+
+  // Calculate available lines for sessions panel
+  const termHeight = process.stdout.rows || 24;
+  const headerLines = 4;  // header, indicators, separator, blank
+  const footerLines = 2;  // footer + blank
+  const hooksHeaderLines = 3;  // if hooks panel shown
+  const availableLines = termHeight - headerLines - footerLines;
+  const maxSessionLines = showHooks ? Math.floor(availableLines * 0.7) : availableLines;
 
   // Header
   output += `${ANSI.bold}agentwatch${ANSI.reset} ${ANSI.dim}${now}${ANSI.reset}\n`;
@@ -304,16 +361,21 @@ async function renderDisplay(state: WatchState): Promise<string> {
   if (showLastLine) indicators.push(`${ANSI.green}L${ANSI.reset}`);
   if (showStats) indicators.push(`${ANSI.green}S${ANSI.reset}`);
   if (agentsOnly) indicators.push(`${ANSI.magenta}F${ANSI.reset}`);
+  if (expandAll) indicators.push(`${ANSI.green}E${ANSI.reset}`);
   if (showHooks) indicators.push(`${ANSI.green}H${ANSI.reset}`);
 
-  output += `${ANSI.dim}[${indicators.join("")}] l:line s:stats f:filter h:hooks ?:help q:quit${ANSI.reset}\n`;
+  output += `${ANSI.dim}[${indicators.join("")}] l:line s:stats f:filter e:expand h:hooks ?:help q:quit${ANSI.reset}\n`;
   output += `${ANSI.dim}${"─".repeat(70)}${ANSI.reset}\n\n`;
 
-  // Collect pane data
+  // Collect pane data (only for expanded sessions to save resources)
   const paneTargets: string[] = [];
   const panePids: number[] = [];
 
-  for (const session of sessions) {
+  for (let i = 0; i < sessions.length; i++) {
+    const session = sessions[i];
+    const isExpanded = expandAll || i === state.selectedIndex;
+    if (!isExpanded) continue;  // Skip collapsed sessions
+
     for (const window of session.windowList) {
       for (const pane of window.panes) {
         if (showLastLine) {
@@ -331,7 +393,7 @@ async function renderDisplay(state: WatchState): Promise<string> {
     showStats ? getProcessStatsBatch(panePids) : Promise.resolve(new Map<number, ProcessStats>()),
   ]);
 
-  const sessionsContent = renderSessions(state, capturedLines, processStats);
+  const sessionsContent = renderSessions(state, capturedLines, processStats, maxSessionLines);
 
   if (showHooks && state.hooksEnabled) {
     const hooksContent = renderHooks(state);
@@ -463,6 +525,9 @@ async function interactiveLoop(state: WatchState): Promise<void> {
       needsRefresh = true;
     } else if (key === "f") {
       state.agentsOnly = !state.agentsOnly;
+      needsRefresh = true;
+    } else if (key === "e") {
+      state.expandAll = !state.expandAll;
       needsRefresh = true;
     } else if (key === "r") {
       needsRefresh = true;
@@ -634,7 +699,9 @@ Examples:
     showHelp: false,
     showHooks: hooksEnabled,
     agentsOnly: values["agents-only"] ?? false,
+    expandAll: false,  // collapsed by default, only selected expanded
     selectedIndex: 0,
+    scrollOffset: 0,
     sessions: [],
     recentHooks: [],
     hooksPort,

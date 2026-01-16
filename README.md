@@ -185,6 +185,7 @@ bun run watch.ts [options]
 | `l` | Toggle last-line display |
 | `s` | Toggle stats display |
 | `f` | Toggle agents-only filter |
+| `e` | Toggle expand all (default: only selected expanded) |
 | `h` | Toggle hooks panel |
 | `r` | Refresh now |
 | `?` | Toggle help |
