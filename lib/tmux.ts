@@ -353,9 +353,24 @@ function getDescendantsFromTree(pid: number, childrenMap: Map<number, number[]>)
   return descendants;
 }
 
+// Cache for process stats (refresh every 5 seconds)
+let statsCache: { data: Map<number, ProcessStats>; timestamp: number } | null = null;
+const STATS_CACHE_TTL = 5000;
+
 /** Get stats for multiple PIDs efficiently with a single ps call */
 export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, ProcessStats>> {
   if (pids.length === 0) return new Map();
+
+  // Return cached stats if still valid
+  if (statsCache && Date.now() - statsCache.timestamp < STATS_CACHE_TTL) {
+    // Filter to only requested PIDs
+    const result = new Map<number, ProcessStats>();
+    for (const pid of pids) {
+      const cached = statsCache.data.get(pid);
+      if (cached) result.set(pid, cached);
+    }
+    return result;
+  }
 
   try {
     // Single ps call to get ALL processes with their parent PIDs and stats
@@ -424,6 +439,8 @@ export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, 
       });
     }
 
+    // Cache the results
+    statsCache = { data: result, timestamp: Date.now() };
     return result;
   } catch {
     return new Map();
