@@ -52,6 +52,8 @@ function isAgentCommand(cmd: string | undefined): boolean {
 
 type SortMode = "name" | "created" | "activity";
 
+type FocusPanel = "sessions" | "hooks";
+
 // State for the unified TUI
 type WatchState = {
   filter: string | undefined;
@@ -60,11 +62,15 @@ type WatchState = {
   showStats: boolean;
   showHelp: boolean;
   showHooks: boolean;
+  showHookDetail: boolean;  // true = show full detail of selected hook
   agentsOnly: boolean;
   expandAll: boolean;  // false = only selected session expanded
   sortBy?: SortMode;
+  focusPanel: FocusPanel;
   selectedIndex: number;
   scrollOffset: number;  // for viewport scrolling
+  selectedHookIndex: number;
+  hookScrollOffset: number;
   sessions: TmuxSessionInfo[];
   visibleSessions: TmuxSessionInfo[];
   sessionMeta: Map<string, SessionMetaEntry>;
@@ -148,7 +154,9 @@ ${ANSI.dim}${"─".repeat(50)}${ANSI.reset}
   ${ANSI.cyan}Navigation${ANSI.reset}
   j/↓      Move selection down
   k/↑      Move selection up
-  Enter/a  Attach to selected session
+  Tab      Switch focus: sessions ↔ hooks
+  Enter    Attach to session / view hook detail
+  Esc      Close detail view
 
   ${ANSI.cyan}Display${ANSI.reset}
   l        Toggle last line output
@@ -312,18 +320,21 @@ function renderSessions(
   detectedAgents: Map<number, DetectedAgent>,
   maxLines: number
 ): string {
-  const { showLastLine, showStats, selectedIndex, filter, agentsOnly, expandAll } = state;
+  const { showLastLine, showStats, selectedIndex, filter, agentsOnly, expandAll, focusPanel, showHooks } = state;
   const sessions = state.visibleSessions;
   let { scrollOffset } = state;
   const now = Math.floor(Date.now() / 1000);
+  const isFocused = focusPanel === "sessions";
 
   const lines: string[] = [];
 
-  // Header
-  let header = `${ANSI.bold}Sessions${ANSI.reset}`;
+  // Header with focus indicator
+  const focusIndicator = (showHooks && isFocused) ? `${ANSI.green}▶${ANSI.reset} ` : (showHooks ? "  " : "");
+  let header = `${focusIndicator}${ANSI.bold}Sessions${ANSI.reset}`;
   if (filter) header += ` ${ANSI.dim}(${filter})${ANSI.reset}`;
   if (agentsOnly) header += ` ${ANSI.magenta}[agents]${ANSI.reset}`;
   if (!expandAll) header += ` ${ANSI.dim}[collapsed]${ANSI.reset}`;
+  if (showHooks && isFocused) header += ` ${ANSI.dim}Tab:hooks${ANSI.reset}`;
   lines.push(header);
   lines.push(`${ANSI.dim}${"─".repeat(35)}${ANSI.reset}`);
 
@@ -446,12 +457,16 @@ function renderSessions(
 }
 
 function renderHooks(state: WatchState): string {
-  const hooks = state.recentHooks.slice(-20);
+  const hooks = state.recentHooks;
+  const isFocused = state.focusPanel === "hooks";
 
   let output = "";
-  output += `${ANSI.bold}Hooks${ANSI.reset} ${ANSI.dim}(:${state.hooksPort})${ANSI.reset}`;
-  output += ` ${ANSI.dim}${hooks.length} recent${ANSI.reset}\n`;
-  output += `${ANSI.dim}${"─".repeat(35)}${ANSI.reset}\n`;
+  const focusIndicator = isFocused ? `${ANSI.green}▶${ANSI.reset} ` : "  ";
+  output += `${focusIndicator}${ANSI.bold}Hooks${ANSI.reset} ${ANSI.dim}(:${state.hooksPort})${ANSI.reset}`;
+  output += ` ${ANSI.dim}${hooks.length} total${ANSI.reset}`;
+  if (isFocused) output += ` ${ANSI.dim}Tab:sessions Enter:detail${ANSI.reset}`;
+  output += "\n";
+  output += `${ANSI.dim}${"─".repeat(40)}${ANSI.reset}\n`;
 
   if (hooks.length === 0) {
     output += `${ANSI.dim}No hooks yet${ANSI.reset}\n`;
@@ -459,28 +474,90 @@ function renderHooks(state: WatchState): string {
     return output;
   }
 
-  // Show most recent first
+  // Show most recent first, with selection indicator
   const reversed = [...hooks].reverse().slice(0, 15);
-  for (const hook of reversed) {
+  for (let i = 0; i < reversed.length; i++) {
+    const hook = reversed[i];
+    const isSelected = isFocused && i === state.selectedHookIndex;
     const color = getEventColor(hook.event);
     const time = formatTimestamp(hook.timestamp);
     const eventShort = hook.event.replace("pre-tool-use", "pre").replace("post-tool-use", "post");
     const payloadStr = formatHookPayload(hook.payload);
 
-    output += `${ANSI.dim}${time}${ANSI.reset} `;
-    output += `${color}${eventShort.padEnd(5)}${ANSI.reset} `;
-    output += `${ANSI.dim}${payloadStr}${ANSI.reset}\n`;
+    const selectMark = isSelected ? `${ANSI.inverse}►${ANSI.reset}` : " ";
+    const lineColor = isSelected ? ANSI.bold : "";
+    const lineReset = isSelected ? ANSI.reset : "";
+
+    output += `${selectMark}${lineColor}${ANSI.dim}${time}${ANSI.reset} `;
+    output += `${lineColor}${color}${eventShort.padEnd(5)}${ANSI.reset} `;
+    output += `${lineColor}${ANSI.dim}${payloadStr}${ANSI.reset}${lineReset}\n`;
+  }
+
+  return output;
+}
+
+function renderHookDetail(state: WatchState): string {
+  const hooks = [...state.recentHooks].reverse();
+  const hook = hooks[state.selectedHookIndex];
+
+  if (!hook) {
+    return `${ANSI.bold}No hook selected${ANSI.reset}\n\nPress Esc or q to go back.`;
+  }
+
+  const termHeight = process.stdout.rows || 24;
+  const termWidth = process.stdout.columns || 80;
+
+  let output = "";
+  output += `${ANSI.bold}Hook Detail${ANSI.reset} ${ANSI.dim}(Esc/q:back j/k:scroll)${ANSI.reset}\n`;
+  output += `${ANSI.dim}${"─".repeat(Math.min(70, termWidth - 2))}${ANSI.reset}\n\n`;
+
+  // Header info
+  const color = getEventColor(hook.event);
+  output += `${ANSI.bold}Event:${ANSI.reset}     ${color}${hook.event}${ANSI.reset}\n`;
+  output += `${ANSI.bold}Time:${ANSI.reset}      ${hook.timestamp}\n`;
+  output += `${ANSI.bold}ID:${ANSI.reset}        ${ANSI.dim}${hook.id}${ANSI.reset}\n`;
+  output += "\n";
+
+  // Pretty print payload
+  output += `${ANSI.bold}Payload:${ANSI.reset}\n`;
+  const payloadJson = JSON.stringify(hook.payload, null, 2);
+  const payloadLines = payloadJson.split("\n");
+
+  // Apply scroll offset
+  const maxVisibleLines = termHeight - 12;  // Reserve space for header/footer
+  const scrollOffset = Math.min(state.hookScrollOffset, Math.max(0, payloadLines.length - maxVisibleLines));
+  const visibleLines = payloadLines.slice(scrollOffset, scrollOffset + maxVisibleLines);
+
+  for (const line of visibleLines) {
+    // Basic syntax highlighting for JSON
+    const highlighted = line
+      .replace(/"([^"]+)":/g, `${ANSI.cyan}"$1"${ANSI.reset}:`)  // keys
+      .replace(/: "([^"]*)"/g, `: ${ANSI.green}"$1"${ANSI.reset}`)  // string values
+      .replace(/: (\d+)/g, `: ${ANSI.yellow}$1${ANSI.reset}`)  // numbers
+      .replace(/: (true|false|null)/g, `: ${ANSI.magenta}$1${ANSI.reset}`);  // booleans/null
+    output += `  ${highlighted}\n`;
+  }
+
+  if (scrollOffset > 0) {
+    output = output.replace("\n\n", `\n${ANSI.dim}↑ ${scrollOffset} lines above${ANSI.reset}\n\n`);
+  }
+  if (scrollOffset + maxVisibleLines < payloadLines.length) {
+    output += `${ANSI.dim}↓ ${payloadLines.length - scrollOffset - maxVisibleLines} lines below${ANSI.reset}\n`;
   }
 
   return output;
 }
 
 async function renderDisplay(state: WatchState): Promise<string> {
-  const { showLastLine, showStats, showHelp, showHooks, agentsOnly, expandAll, sortBy } = state;
+  const { showLastLine, showStats, showHelp, showHooks, showHookDetail, agentsOnly, expandAll, sortBy } = state;
   const sessions = state.visibleSessions;
 
   if (showHelp) {
     return renderHelp();
+  }
+
+  if (showHookDetail) {
+    return renderHookDetail(state);
   }
 
   let output = "";
@@ -742,13 +819,66 @@ async function interactiveLoop(state: WatchState): Promise<void> {
 
   process.stdin.on("data", async (key: string) => {
     const code = key.charCodeAt(0);
-    const maxIndex = Math.max(0, state.visibleSessions.length - 1);
+    const maxSessionIndex = Math.max(0, state.visibleSessions.length - 1);
+    const maxHookIndex = Math.max(0, state.recentHooks.length - 1);
 
+    // Escape closes detail view or help
+    if (key === "\x1b" || key === "\x1b\x1b") {
+      if (state.showHookDetail) {
+        state.showHookDetail = false;
+        needsRefresh = true;
+        return;
+      }
+      if (state.showHelp) {
+        state.showHelp = false;
+        needsRefresh = true;
+        return;
+      }
+    }
+
+    // Help view - any key closes
+    if (state.showHelp) {
+      state.showHelp = false;
+      needsRefresh = true;
+      return;
+    }
+
+    // Hook detail view - Esc/q closes, j/k scrolls
+    if (state.showHookDetail) {
+      if (key === "q") {
+        state.showHookDetail = false;
+        needsRefresh = true;
+      } else if (key === "\x1b[A" || key === "k") {
+        state.hookScrollOffset = Math.max(0, state.hookScrollOffset - 1);
+        needsRefresh = true;
+      } else if (key === "\x1b[B" || key === "j") {
+        state.hookScrollOffset += 1;
+        needsRefresh = true;
+      }
+      return;
+    }
+
+    // Tab toggles focus between sessions and hooks
+    if (key === "\t" && state.showHooks && state.hooksEnabled) {
+      state.focusPanel = state.focusPanel === "sessions" ? "hooks" : "sessions";
+      needsRefresh = true;
+      return;
+    }
+
+    // Navigation - depends on focused panel
     if (key === "\x1b[A" || key === "k") {
-      state.selectedIndex = Math.max(0, state.selectedIndex - 1);
+      if (state.focusPanel === "hooks") {
+        state.selectedHookIndex = Math.max(0, state.selectedHookIndex - 1);
+      } else {
+        state.selectedIndex = Math.max(0, state.selectedIndex - 1);
+      }
       needsRefresh = true;
     } else if (key === "\x1b[B" || key === "j") {
-      state.selectedIndex = Math.min(maxIndex, state.selectedIndex + 1);
+      if (state.focusPanel === "hooks") {
+        state.selectedHookIndex = Math.min(maxHookIndex, state.selectedHookIndex + 1);
+      } else {
+        state.selectedIndex = Math.min(maxSessionIndex, state.selectedIndex + 1);
+      }
       needsRefresh = true;
     } else if (key === "q" || code === 3) {
       cleanup();
@@ -763,6 +893,7 @@ async function interactiveLoop(state: WatchState): Promise<void> {
       needsRefresh = true;
     } else if (key === "h") {
       state.showHooks = !state.showHooks;
+      if (!state.showHooks) state.focusPanel = "sessions";
       needsRefresh = true;
     } else if (key === "f") {
       state.agentsOnly = !state.agentsOnly;
@@ -772,29 +903,33 @@ async function interactiveLoop(state: WatchState): Promise<void> {
       needsRefresh = true;
     } else if (key === "r") {
       needsRefresh = true;
-    } else if ((key === "\r" || key === "\n" || key === "a") && state.visibleSessions.length > 0) {
-      const session = state.visibleSessions[state.selectedIndex];
-      if (session) {
-        await attachToSession(session.name);
-        setupRawMode();
-        process.stdout.write(ANSI.hideCursor);
+    } else if (key === "\r" || key === "\n" || key === "a") {
+      if (state.focusPanel === "hooks" && state.recentHooks.length > 0) {
+        // Show hook detail
+        state.showHookDetail = true;
+        state.hookScrollOffset = 0;
         needsRefresh = true;
+      } else if (state.focusPanel === "sessions" && state.visibleSessions.length > 0) {
+        const session = state.visibleSessions[state.selectedIndex];
+        if (session) {
+          await attachToSession(session.name);
+          setupRawMode();
+          process.stdout.write(ANSI.hideCursor);
+          needsRefresh = true;
+        }
       }
-    } else if (key === "x" && state.visibleSessions.length > 0) {
+    } else if (key === "x" && state.focusPanel === "sessions" && state.visibleSessions.length > 0) {
       const session = state.visibleSessions[state.selectedIndex];
       if (session) {
         await killSession(session.name);
         needsRefresh = true;
       }
-    } else if (key === "d" && state.visibleSessions.length > 0) {
+    } else if (key === "d" && state.focusPanel === "sessions" && state.visibleSessions.length > 0) {
       const session = state.visibleSessions[state.selectedIndex];
       if (session) {
         await markSessionDone(state, session);
         needsRefresh = true;
       }
-    } else if (state.showHelp) {
-      state.showHelp = false;
-      needsRefresh = true;
     }
   });
 
@@ -958,11 +1093,15 @@ Examples:
     showStats: !values["no-stats"],          // ON by default
     showHelp: false,
     showHooks: hooksEnabled,
+    showHookDetail: false,
     agentsOnly: !values.all,       // ON by default (filter to agents), --all or -A to show all
     expandAll: !values["no-expand"],  // ON by default (all expanded), --no-expand to collapse
     sortBy,
+    focusPanel: "sessions",
     selectedIndex: 0,
     scrollOffset: 0,
+    selectedHookIndex: 0,
+    hookScrollOffset: 0,
     sessions: [],
     visibleSessions: [],
     sessionMeta: new Map(),
