@@ -585,10 +585,8 @@ function createHooksApp(state: WatchState): Hono {
   const app = new Hono();
   const hooksFile = () => `${expandHome(state.dataDir)}/hooks.jsonl`;
 
-  app.post("/hooks/:event", async (c) => {
-    const event = c.req.param("event");
-    const payload = await c.req.json().catch(() => ({}));
-
+  // Shared handler for both /hooks/:event and /api/hooks/:event
+  const handleHook = async (event: string, payload: Record<string, unknown>) => {
     const entry: HookEntry = {
       id: createId("hook"),
       timestamp: new Date().toISOString(),
@@ -612,7 +610,20 @@ function createHooksApp(state: WatchState): Hono {
     if (state.notifyConfig.desktop || state.notifyConfig.webhook) {
       notifyHook(entry, state.notifyConfig).catch(() => {});
     }
+  };
 
+  // Support both /hooks/:event and /api/hooks/:event (for Claude Code compatibility)
+  app.post("/hooks/:event", async (c) => {
+    const event = c.req.param("event");
+    const payload = await c.req.json().catch(() => ({}));
+    await handleHook(event, payload);
+    return c.json({});
+  });
+
+  app.post("/api/hooks/:event", async (c) => {
+    const event = c.req.param("event");
+    const payload = await c.req.json().catch(() => ({}));
+    await handleHook(event, payload);
     return c.json({});
   });
 
@@ -629,7 +640,7 @@ function createHooksApp(state: WatchState): Hono {
   app.get("/hooks/health", (c) => c.json({ ok: true, service: "agentwatch" }));
   app.get("/", (c) => c.json({
     service: "agentwatch",
-    endpoints: ["POST /hooks/:event", "GET /hooks/recent", "GET /hooks/health"],
+    endpoints: ["POST /hooks/:event", "POST /api/hooks/:event", "GET /hooks/recent", "GET /hooks/health"],
   }));
 
   return app;

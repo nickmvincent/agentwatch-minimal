@@ -107,5 +107,5 @@ export const AGENT_CONFIGS: Record<AgentType, AgentConfig> = {
 };
 
 export const DEFAULT_SESSION_PREFIX = "awm";
-export const DEFAULT_HOOKS_PORT = 8750;
+export const DEFAULT_HOOKS_PORT = 8702;
 export const DEFAULT_DATA_DIR = "~/.agentwatch-minimal";
