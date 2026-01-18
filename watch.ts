@@ -53,9 +53,14 @@ function isAgentCommand(cmd: string | undefined): boolean {
 type SortMode = "name" | "created" | "activity";
 
 const REFRESH_PRESETS = [1000, 2000, 5000, 10000] as const;
-const NOTIFY_FILTER_PRESETS: (string[] | undefined)[] = [
-  undefined, ["pre-tool-use"], ["post-tool-use"], ["error"]
-];
+
+// Filter popup options
+const FILTER_OPTIONS = [
+  { key: "pre-tool-use", label: "pre-tool-use", short: "pre" },
+  { key: "post-tool-use", label: "post-tool-use", short: "post" },
+  { key: "error", label: "error", short: "err" },
+  { key: "notification", label: "notification", short: "notif" },
+] as const;
 
 type FocusPanel = "sessions" | "hooks";
 
@@ -66,6 +71,11 @@ type WatchState = {
   showLastLine: boolean;
   showStats: boolean;
   showHelp: boolean;
+  showDetailedHelp: boolean;  // true = show extended documentation
+  detailedHelpScrollOffset: number;
+  showFilterPopup: boolean;  // true = show notification filter selector
+  filterPopupIndex: number;  // cursor position in filter popup
+  filterPopupSelected: Set<string>;  // temporarily selected filters
   showHooks: boolean;
   showHookDetail: boolean;  // true = show full detail of selected hook
   agentsOnly: boolean;
@@ -203,7 +213,7 @@ ${ANSI.dim}${"─".repeat(50)}${ANSI.reset}
   Enter    Attach to session / view hook detail
   Esc      Close detail view
 
-  ${ANSI.cyan}Display Toggles${ANSI.reset}
+  ${ANSI.cyan}Display Toggles${ANSI.reset} (lowercase)
   l        Toggle last line output
   s        Toggle CPU/memory stats
   f        Toggle agents-only filter
@@ -211,22 +221,278 @@ ${ANSI.dim}${"─".repeat(50)}${ANSI.reset}
   h        Toggle hooks panel
   r        Refresh now
 
-  ${ANSI.cyan}Runtime Options${ANSI.reset}
+  ${ANSI.cyan}Runtime Options${ANSI.reset} (uppercase)
   S        Cycle sort mode (none → name → created → activity)
   R        Cycle refresh interval (1s → 2s → 5s → 10s)
   N        Toggle desktop notifications
-  F        Cycle notify filter (all → pre → post → error)
+  F        Select notification filter
 
   ${ANSI.cyan}Actions${ANSI.reset}
   x        Kill selected session
-  d        Mark session done
+  D        Mark session done
 
   ${ANSI.cyan}General${ANSI.reset}
   ?        Toggle this help
   q        Quit
 
-${ANSI.dim}Press any key to close help${ANSI.reset}
+${ANSI.bold}d${ANSI.reset}${ANSI.dim}:more details  any other key:close${ANSI.reset}
 `;
+}
+
+// Detailed help - data-driven for maintainability
+// Each section documents a feature with its related state/keys
+const DETAILED_HELP_SECTIONS = [
+  {
+    title: "Status Bar Reference",
+    content: `
+The TUI displays three status bars at the top:
+
+${ANSI.bold}Line 1: Title Bar${ANSI.reset}
+  agentwatch HH:MM:SS sort:MODE
+  - Shows current time and active sort mode
+
+${ANSI.bold}Line 2: Display Toggles${ANSI.reset}
+  [LSFEH] l:line s:stats f:filter e:expand h:hooks ...
+  - Brackets show active toggles (green=on)
+  - L: Show last line of pane output
+  - S: Show CPU/memory stats per pane
+  - F: Filter to agent processes only (magenta when on)
+  - E: Expand all sessions (vs only selected)
+  - H: Show hooks panel
+
+${ANSI.bold}Line 3: Runtime Options${ANSI.reset}
+  [S:nam] [R:2s] [N:on] [F:all] S:sort R:refresh N:notify F:filter
+  - S:xxx = Sort mode (--/nam/cre/act)
+  - R:Xs  = Refresh interval (1s/2s/5s/10s)
+  - N:on/off = Desktop notifications enabled
+  - F:xxx = Notification filter (all/pre/post/err)
+
+${ANSI.bold}Line 4: Info Bar${ANSI.reset}
+  data:~/.agentwatch | hooks::8702 | sessions:N
+  - Data directory location
+  - Hooks server port
+  - Total session count`,
+  },
+  {
+    title: "Sort Modes (S key)",
+    content: `
+Press ${ANSI.bold}S${ANSI.reset} to cycle through sort modes:
+
+  ${ANSI.cyan}none${ANSI.reset} (--) : tmux default order
+  ${ANSI.cyan}name${ANSI.reset} (nam): Alphabetical by session name
+  ${ANSI.cyan}created${ANSI.reset} (cre): Newest sessions first
+  ${ANSI.cyan}activity${ANSI.reset} (act): Most recently active first
+
+Sort mode persists until changed or session ends.`,
+  },
+  {
+    title: "Refresh Interval (R key)",
+    content: `
+Press ${ANSI.bold}R${ANSI.reset} to cycle through refresh intervals:
+
+  ${ANSI.cyan}1s${ANSI.reset}  : Fast updates, higher CPU
+  ${ANSI.cyan}2s${ANSI.reset}  : Default balance
+  ${ANSI.cyan}5s${ANSI.reset}  : Relaxed updates
+  ${ANSI.cyan}10s${ANSI.reset} : Minimal updates
+
+Press ${ANSI.bold}r${ANSI.reset} (lowercase) to force immediate refresh.`,
+  },
+  {
+    title: "Desktop Notifications (N key)",
+    content: `
+Press ${ANSI.bold}N${ANSI.reset} to toggle desktop notifications on/off.
+
+When enabled, hooks received by the server trigger system
+notifications via terminal-notifier (macOS) or notify-send (Linux).
+
+Use with ${ANSI.bold}F${ANSI.reset} key to filter which events notify.`,
+  },
+  {
+    title: "Notification Filter (F key)",
+    content: `
+Press ${ANSI.bold}F${ANSI.reset} to open filter selector (only when N:on).
+
+Filter options:
+  ${ANSI.cyan}all${ANSI.reset}   : Notify on all hook events
+  ${ANSI.cyan}pre${ANSI.reset}   : Only pre-tool-use events
+  ${ANSI.cyan}post${ANSI.reset}  : Only post-tool-use events
+  ${ANSI.cyan}error${ANSI.reset} : Only error events
+
+Use arrow keys to select, Enter to confirm, Esc to cancel.`,
+  },
+  {
+    title: "Hooks Panel (h key)",
+    content: `
+Press ${ANSI.bold}h${ANSI.reset} to toggle the hooks panel.
+
+The hooks panel shows recent webhook events received on the
+embedded server (default port 8702).
+
+${ANSI.bold}Hook Types:${ANSI.reset}
+  ${ANSI.cyan}pre${ANSI.reset}   : Before tool execution (cyan)
+  ${ANSI.green}post${ANSI.reset}  : After tool execution (green)
+  ${ANSI.yellow}notif${ANSI.reset} : Notification events (yellow)
+  ${ANSI.red}error${ANSI.reset} : Error events (red)
+
+Press ${ANSI.bold}Tab${ANSI.reset} to switch focus between sessions and hooks.
+Press ${ANSI.bold}Enter${ANSI.reset} on a hook to see full JSON payload.`,
+  },
+  {
+    title: "Session Management",
+    content: `
+${ANSI.bold}Attach to Session${ANSI.reset}
+  Press ${ANSI.bold}Enter${ANSI.reset} or ${ANSI.bold}a${ANSI.reset} to attach to selected session.
+  Returns to watch view when you detach (Ctrl-b d).
+
+${ANSI.bold}Kill Session${ANSI.reset}
+  Press ${ANSI.bold}x${ANSI.reset} to kill selected session immediately.
+  No confirmation - use carefully.
+
+${ANSI.bold}Mark Done${ANSI.reset}
+  Press ${ANSI.bold}D${ANSI.reset} to mark session as done.
+  - Renames session to "name-done"
+  - Updates metadata with status=done
+  - Session remains visible but marked`,
+  },
+  {
+    title: "Display Toggles Reference",
+    content: `
+${ANSI.bold}l${ANSI.reset} - Last Line Output
+  Shows the last line from each pane's terminal output.
+  Useful for seeing agent progress at a glance.
+
+${ANSI.bold}s${ANSI.reset} - Stats (CPU/Memory)
+  Shows cpu:X% mem:XM for each pane's process.
+  Updates each refresh cycle.
+
+${ANSI.bold}f${ANSI.reset} - Filter (Agents Only)
+  When on (magenta F), only shows sessions/panes
+  running known agent commands: claude, codex, gemini, node, bun
+
+${ANSI.bold}e${ANSI.reset} - Expand All
+  When on, shows all session details.
+  When off, only selected session is expanded.
+
+${ANSI.bold}h${ANSI.reset} - Hooks Panel
+  Toggles the hooks side panel on/off.`,
+  },
+  {
+    title: "Command Line Options",
+    content: `
+${ANSI.bold}Filtering & Display${ANSI.reset}
+  -f, --filter PREFIX   Filter sessions by name prefix
+  -A, --all             Show all sessions (not just agents)
+  --no-expand           Start with sessions collapsed
+  --sort MODE           Initial sort: name, created, activity
+  --no-last-line        Hide pane output
+  --no-stats            Hide CPU/memory stats
+
+${ANSI.bold}Hooks Server${ANSI.reset}
+  --hooks-port PORT     Server port (default: 8702)
+  --no-hooks            Disable hooks server
+  --hooks-daemon        Run hooks server only (no TUI)
+  --forward-to URL      Forward hooks to another server
+
+${ANSI.bold}Notifications${ANSI.reset}
+  --notify-desktop      Enable desktop notifications
+  --notify-webhook URL  Forward to webhook URL
+  --notify-filter LIST  Comma-separated event types
+
+${ANSI.bold}Other${ANSI.reset}
+  -i, --interval MS     Refresh interval (default: 2000)
+  -d, --data-dir PATH   Data directory
+  -o, --once            Run once and exit
+  --no-interactive      Disable interactive mode`,
+  },
+  {
+    title: "Data Files",
+    content: `
+agentwatch stores data in the data directory (default: ~/.agentwatch):
+
+${ANSI.bold}hooks.jsonl${ANSI.reset}
+  Append-only log of all received webhook events.
+  Each line is a JSON object with: id, timestamp, event, payload
+
+${ANSI.bold}sessions.jsonl${ANSI.reset}
+  Session metadata from launch.ts and manual operations.
+  Tracks: sessionName, agent, cwd, tag, status, promptPreview
+
+Files use JSONL format (one JSON object per line) for
+append-friendly logging and easy parsing.`,
+  },
+];
+
+function renderDetailedHelp(state: WatchState): string {
+  const termHeight = process.stdout.rows || 24;
+  const termWidth = process.stdout.columns || 80;
+  const maxVisibleLines = termHeight - 4;  // Header + footer
+
+  // Build all content lines
+  const allLines: string[] = [];
+  allLines.push(`${ANSI.bold}Detailed Documentation${ANSI.reset}`);
+  allLines.push(`${ANSI.dim}${"─".repeat(Math.min(60, termWidth - 4))}${ANSI.reset}`);
+  allLines.push("");
+
+  for (const section of DETAILED_HELP_SECTIONS) {
+    allLines.push(`${ANSI.bold}${ANSI.cyan}## ${section.title}${ANSI.reset}`);
+    const contentLines = section.content.trim().split("\n");
+    allLines.push(...contentLines);
+    allLines.push("");
+  }
+
+  // Apply scroll offset
+  const scrollOffset = Math.min(
+    state.detailedHelpScrollOffset,
+    Math.max(0, allLines.length - maxVisibleLines)
+  );
+  const visibleLines = allLines.slice(scrollOffset, scrollOffset + maxVisibleLines);
+
+  let output = "";
+  for (const line of visibleLines) {
+    output += line + "\n";
+  }
+
+  // Scroll indicators
+  if (scrollOffset > 0) {
+    output = `${ANSI.dim}↑ ${scrollOffset} lines above${ANSI.reset}\n` + output;
+  }
+  if (scrollOffset + maxVisibleLines < allLines.length) {
+    output += `${ANSI.dim}↓ ${allLines.length - scrollOffset - maxVisibleLines} lines below${ANSI.reset}\n`;
+  }
+
+  output += `\n${ANSI.dim}j/k:scroll  q/Esc:back${ANSI.reset}`;
+  return output;
+}
+
+function renderFilterPopup(state: WatchState): string {
+  let output = "";
+  output += `${ANSI.bold}Notification Filter${ANSI.reset}\n`;
+  output += `${ANSI.dim}${"─".repeat(35)}${ANSI.reset}\n`;
+  output += `${ANSI.dim}Select which events to notify on:${ANSI.reset}\n\n`;
+
+  for (let i = 0; i < FILTER_OPTIONS.length; i++) {
+    const opt = FILTER_OPTIONS[i];
+    const isSelected = state.filterPopupSelected.has(opt.key);
+    const isCursor = i === state.filterPopupIndex;
+
+    const cursor = isCursor ? `${ANSI.yellow}▶${ANSI.reset}` : " ";
+    const checkbox = isSelected ? `${ANSI.green}[✓]${ANSI.reset}` : `${ANSI.dim}[ ]${ANSI.reset}`;
+    const label = isCursor ? `${ANSI.bold}${opt.label}${ANSI.reset}` : opt.label;
+
+    output += `  ${cursor} ${checkbox} ${label}\n`;
+  }
+
+  output += `\n${ANSI.dim}${"─".repeat(35)}${ANSI.reset}\n`;
+
+  // Show preview of current selection
+  const selected = Array.from(state.filterPopupSelected);
+  const preview = selected.length === 0 ? "all events" :
+    selected.length === FILTER_OPTIONS.length ? "all events" :
+    selected.map(s => FILTER_OPTIONS.find(o => o.key === s)?.short ?? s).join(", ");
+  output += `${ANSI.dim}Current: ${preview}${ANSI.reset}\n\n`;
+
+  output += `${ANSI.dim}↑↓/jk:move  Space:toggle  Enter:apply  Esc:cancel${ANSI.reset}`;
+  return output;
 }
 
 function renderTwoColumn(state: WatchState, leftContent: string, rightContent: string): string {
@@ -600,11 +866,19 @@ function renderHookDetail(state: WatchState): string {
 }
 
 async function renderDisplay(state: WatchState): Promise<string> {
-  const { showLastLine, showStats, showHelp, showHooks, showHookDetail, agentsOnly, expandAll, sortBy } = state;
+  const { showLastLine, showStats, showHelp, showDetailedHelp, showFilterPopup, showHooks, showHookDetail, agentsOnly, expandAll, sortBy } = state;
   const sessions = state.visibleSessions;
+
+  if (showDetailedHelp) {
+    return renderDetailedHelp(state);
+  }
 
   if (showHelp) {
     return renderHelp();
+  }
+
+  if (showFilterPopup) {
+    return renderFilterPopup(state);
   }
 
   if (showHookDetail) {
@@ -634,7 +908,7 @@ async function renderDisplay(state: WatchState): Promise<string> {
   if (expandAll) indicators.push(`${ANSI.green}E${ANSI.reset}`);
   if (showHooks) indicators.push(`${ANSI.green}H${ANSI.reset}`);
 
-  output += `${ANSI.dim}[${indicators.join("")}] l:line s:stats f:filter e:expand h:hooks d:done ?:help q:quit${ANSI.reset}\n`;
+  output += `${ANSI.dim}[${indicators.join("")}] l:line s:stats f:filter e:expand h:hooks D:done ?:help q:quit${ANSI.reset}\n`;
 
   // Runtime options bar
   const sortLabelShort = state.sortBy?.slice(0, 3) ?? "--";
@@ -705,7 +979,7 @@ async function renderDisplay(state: WatchState): Promise<string> {
   }
 
   // Footer
-  output += `\n${ANSI.dim}Enter:attach x:kill d:done ↑↓/jk:nav${state.hooksEnabled ? ` │ hooks::${state.hooksPort}` : ""}${ANSI.reset}\n`;
+  output += `\n${ANSI.dim}Enter:attach x:kill D:done ↑↓/jk:nav${state.hooksEnabled ? ` │ hooks::${state.hooksPort}` : ""}${ANSI.reset}\n`;
 
   return output;
 }
@@ -892,6 +1166,17 @@ async function interactiveLoop(state: WatchState): Promise<void> {
 
     // Escape closes detail view or help
     if (key === "\x1b" || key === "\x1b\x1b") {
+      if (state.showFilterPopup) {
+        state.showFilterPopup = false;
+        needsRefresh = true;
+        return;
+      }
+      if (state.showDetailedHelp) {
+        state.showDetailedHelp = false;
+        state.detailedHelpScrollOffset = 0;
+        needsRefresh = true;
+        return;
+      }
       if (state.showHookDetail) {
         state.showHookDetail = false;
         needsRefresh = true;
@@ -904,9 +1189,63 @@ async function interactiveLoop(state: WatchState): Promise<void> {
       }
     }
 
-    // Help view - any key closes
+    // Filter popup - j/k to navigate, space to toggle, enter to apply
+    if (state.showFilterPopup) {
+      if (key === "\x1b[A" || key === "k") {
+        state.filterPopupIndex = Math.max(0, state.filterPopupIndex - 1);
+        needsRefresh = true;
+      } else if (key === "\x1b[B" || key === "j") {
+        state.filterPopupIndex = Math.min(FILTER_OPTIONS.length - 1, state.filterPopupIndex + 1);
+        needsRefresh = true;
+      } else if (key === " ") {
+        // Toggle current selection
+        const opt = FILTER_OPTIONS[state.filterPopupIndex];
+        if (state.filterPopupSelected.has(opt.key)) {
+          state.filterPopupSelected.delete(opt.key);
+        } else {
+          state.filterPopupSelected.add(opt.key);
+        }
+        needsRefresh = true;
+      } else if (key === "\r" || key === "\n") {
+        // Apply selection
+        const selected = Array.from(state.filterPopupSelected);
+        state.notifyConfig.filter = selected.length === 0 || selected.length === FILTER_OPTIONS.length
+          ? undefined
+          : selected;
+        state.showFilterPopup = false;
+        needsRefresh = true;
+      } else if (key === "q") {
+        state.showFilterPopup = false;
+        needsRefresh = true;
+      }
+      return;
+    }
+
+    // Detailed help view - q/Esc closes, j/k scrolls
+    if (state.showDetailedHelp) {
+      if (key === "q") {
+        state.showDetailedHelp = false;
+        state.detailedHelpScrollOffset = 0;
+        needsRefresh = true;
+      } else if (key === "\x1b[A" || key === "k") {
+        state.detailedHelpScrollOffset = Math.max(0, state.detailedHelpScrollOffset - 1);
+        needsRefresh = true;
+      } else if (key === "\x1b[B" || key === "j") {
+        state.detailedHelpScrollOffset += 1;
+        needsRefresh = true;
+      }
+      return;
+    }
+
+    // Help view - 'd' shows details, other keys close
     if (state.showHelp) {
-      state.showHelp = false;
+      if (key === "d") {
+        state.showHelp = false;
+        state.showDetailedHelp = true;
+        state.detailedHelpScrollOffset = 0;
+      } else {
+        state.showHelp = false;
+      }
       needsRefresh = true;
       return;
     }
@@ -992,7 +1331,7 @@ async function interactiveLoop(state: WatchState): Promise<void> {
         await killSession(session.name);
         needsRefresh = true;
       }
-    } else if (key === "d" && state.focusPanel === "sessions" && state.visibleSessions.length > 0) {
+    } else if (key === "D" && state.focusPanel === "sessions" && state.visibleSessions.length > 0) {
       const session = state.visibleSessions[state.selectedIndex];
       if (session) {
         await markSessionDone(state, session);
@@ -1011,10 +1350,10 @@ async function interactiveLoop(state: WatchState): Promise<void> {
       state.notifyConfig.desktop = !state.notifyConfig.desktop;
       needsRefresh = true;
     } else if (key === "F" && state.notifyConfig.desktop) {
-      const idx = NOTIFY_FILTER_PRESETS.findIndex(p =>
-        JSON.stringify(p) === JSON.stringify(state.notifyConfig.filter)
-      );
-      state.notifyConfig.filter = NOTIFY_FILTER_PRESETS[(idx + 1) % NOTIFY_FILTER_PRESETS.length];
+      // Open filter popup with current selection
+      state.showFilterPopup = true;
+      state.filterPopupIndex = 0;
+      state.filterPopupSelected = new Set(state.notifyConfig.filter ?? []);
       needsRefresh = true;
     }
   });
@@ -1178,6 +1517,11 @@ Examples:
     showLastLine: !values["no-last-line"],  // ON by default
     showStats: !values["no-stats"],          // ON by default
     showHelp: false,
+    showDetailedHelp: false,
+    detailedHelpScrollOffset: 0,
+    showFilterPopup: false,
+    filterPopupIndex: 0,
+    filterPopupSelected: new Set(),
     showHooks: hooksEnabled,
     showHookDetail: false,
     agentsOnly: !values.all,       // ON by default (filter to agents), --all or -A to show all
