@@ -7,7 +7,7 @@ Lightweight toolkit for launching and monitoring coding agents (Claude Code, Cod
 - **launch** - Spawn agents with the same prompt in parallel tmux sessions
 - **orchestrate** - Use Claude to decompose complex prompts into parallel sub-tasks
 - **watch** - Unified TUI: monitor tmux sessions + Claude Code hooks in two-column layout
-  - Embedded hooks server on port 8750
+  - Embedded hooks server on port 8702
   - CPU/memory stats, session duration, pane output
   - Interactive keybinds for navigation, attach, kill
   - `--hooks-daemon` mode for headless hook server
@@ -47,6 +47,13 @@ tmux attach -t awm-claude-xxx
 2. **Watch** sessions to monitor progress across all agents
 3. **Attach** to individual sessions to interact directly
 
+### Why Launch Instead of Manual tmux
+
+- Consistent naming so you can filter/watch and reattach quickly
+- Safe prompt handling for long or complex inputs
+- One command to run multiple agents in parallel
+- Session metadata (tags, previews) for lightweight tracking
+
 ### When to Use Each Command
 
 | Command | Use Case |
@@ -57,21 +64,70 @@ tmux attach -t awm-claude-xxx
 | `watch.ts --hooks-daemon` | Run headless hooks server only |
 | `watch.ts --no-hooks` | Monitor sessions only (no hooks server) |
 
-### Session Naming
+### Session Naming and Prefix
 
 Sessions are named `{prefix}-{agent}-{timestamp}`:
 - `awm-claude-m1abc23` - Claude session
 - `awm-codex-m1abc24` - Codex session
 
-The default prefix is `awm` (agentwatch-minimal). Use `--prefix` to customize.
+The `--prefix` flag controls the first part of the session name. This is purely for naming—it doesn't store metadata or affect agent behavior. The main benefits:
+- **Filtering**: Use `watch.ts --filter myprefix` to show only matching sessions
+- **Grouping**: Keep related work together (e.g., `--prefix auth-fix` for all auth-related sessions)
+- **Avoiding collisions**: Distinguish agentwatch sessions from other tmux sessions
+
+The default prefix is `awm` (agentwatch-minimal).
+
+### Tags
+
+The `--tag` flag stores a label in session metadata (`sessions.jsonl`). Tags are currently write-only—they're persisted but not displayed in the watch UI. They exist for future querying or custom scripts that read the JSONL directly.
+
+### Mark Done
+
+Pressing `d` in `watch.ts` marks a session as done. This does two things:
+1. **Renames the tmux session** by appending `-done` (e.g., `awm-claude-m1abc23` → `awm-claude-m1abc23-done`)
+2. **Writes metadata** to `sessions.jsonl` with `status: "done"`
+
+The session keeps running—it's not killed. The `[done]` badge appears in the watch UI.
 
 ### Tips
 
 - **Compare agents**: Launch the same prompt to claude and codex, watch them work, see which approach you prefer
 - **Parallel decomposition**: Use `orchestrate.ts` for tasks with independent sub-parts (e.g., "add feature X, write tests, update docs")
 - **Stay organized**: Use `--prefix` to group related sessions (e.g., `--prefix auth-fix`)
-- **Tag progress**: Use `--tag` to label sessions and press `d` in `watch.ts` to mark done
 - **Quick check**: Use `watch.ts --once --last-line` for a snapshot without the refresh loop
+
+### Options and When to Use Them
+
+**launch.ts**
+- `--agents` to compare outputs or parallelize a single prompt across CLIs
+- `--cwd`/`--prefix` to target a project and keep related sessions grouped
+- `--prompt-file` when prompts are long, reusable, or generated from scripts
+- `--data-dir` to customize where session metadata is stored
+- `--claude-flags`/`--codex-flags`/`--gemini-flags` to pass through agent-specific options
+
+**orchestrate.ts**
+- `--dry-run` to inspect the plan before launching (plan is discarded unless you also use `--save-plan`)
+- `--dry-run --save-plan ./plan.json` to inspect AND save for later reuse
+- `--plan-file ./plan.json` to rerun a saved plan without re-decomposing
+- `--wait` to auto-launch dependent tasks when prerequisites complete
+- `--cwd`/`--prefix` to scope where tasks run and keep them grouped in tmux
+- `--tag`/`--data-dir` to label and persist orchestration metadata
+- `--claude-flags`/`--codex-flags`/`--gemini-flags` to tune agent behavior per task
+
+**watch.ts (view/interaction)**
+- `--filter`/`--agents-only` to focus on just the sessions and panes you care about
+- `--sort` to triage by activity or creation time
+- `--interval` to trade off refresh rate vs system load
+- `--no-last-line`/`--no-stats` for a minimal, low-noise view
+- `--once`/`--no-interactive` for scriptable snapshots or non-TTY use
+
+**watch.ts (hooks/notifications)**
+- `--hooks-daemon` when you only want the hooks server (no TUI)
+- `--no-hooks` to disable the embedded server when you only need tmux monitoring
+- `--hooks-port` to match your local hook configuration
+- `--forward-to` to fan out hook events to other services
+- `--data-dir` to choose where hook and session metadata is stored
+- `--notify-desktop`/`--notify-webhook`/`--notify-filter` to route alerts where you want them
 
 ### Shell Aliases (Recommended)
 
@@ -129,7 +185,7 @@ bun run launch.ts "your prompt" [options]
 | `--prefix` | `-p` | `awm` | Session name prefix |
 | `--prompt-file` | | (none) | Read prompt from file (`-` = stdin) |
 | `--data-dir` | `-d` | `~/.agentwatch-minimal` | Data directory for session metadata |
-| `--tag` | | (none) | Tag to label sessions |
+| `--tag` | | (none) | Tag stored in metadata (not displayed in UI yet) |
 | `--claude-flags` | | (none) | Extra flags for Claude |
 | `--codex-flags` | | (none) | Extra flags for Codex |
 | `--gemini-flags` | | (none) | Extra flags for Gemini |
@@ -173,13 +229,14 @@ bun run watch.ts [options]
 | `--sort` | | (none) | Sort sessions: name, created, activity |
 | `--no-last-line` | | `false` | Hide pane output (shown by default) |
 | `--no-stats` | | `false` | Hide CPU/memory stats (shown by default) |
-| `--hooks-port` | | `8750` | Hooks server port |
+| `--hooks-port` | | `8702` | Hooks server port |
 | `--no-hooks` | | `false` | Disable embedded hooks server |
 | `--hooks-daemon` | | `false` | Run only hooks server (no TUI) |
 | `--forward-to` | | (none) | Forward hooks to URL (repeatable) |
-| `--data-dir` | `-d` | `~/.agentwatch-minimal` | Data directory for hooks |
+| `--data-dir` | `-d` | `~/.agentwatch-minimal` | Data directory for hooks + sessions |
 | `--notify-desktop` | | `false` | Send desktop notifications |
 | `--notify-webhook` | | (none) | Send webhooks to URL |
+| `--notify-filter` | | (none) | Comma-separated events to notify |
 | `--once` | `-o` | `false` | Run once and exit (no refresh loop) |
 | `--no-interactive` | | `false` | Disable interactive mode |
 | `--help` | `-h` | | Show help |
@@ -192,7 +249,7 @@ bun run watch.ts [options]
 | `k`/`↑` | Move selection up |
 | `Enter`/`a` | Attach to selected session |
 | `x` | Kill selected session |
-| `d` | Mark session done |
+| `d` | Mark done (renames session with `-done` suffix, keeps running) |
 | `l` | Toggle last-line display |
 | `s` | Toggle stats display |
 | `f` | Toggle agents-only filter |
@@ -235,13 +292,13 @@ bun run orchestrate.ts "complex task" [options]
 |------|-------|---------|-------------|
 | `--cwd` | `-c` | current dir | Working directory for agents |
 | `--prefix` | `-p` | `awm` | Session name prefix |
-| `--dry-run` | `-n` | `false` | Show plan without launching agents |
+| `--dry-run` | `-n` | `false` | Show plan without launching (plan discarded unless `--save-plan` used) |
 | `--wait` | `-w` | `false` | Wait for dependencies and auto-launch dependent tasks |
 | `--prompt-file` | | (none) | Read task prompt from file (`-` = stdin) |
 | `--plan-file` | | (none) | Use an existing plan JSON (skip decomposition) |
 | `--save-plan` | | (none) | Save the generated plan to a file |
 | `--data-dir` | `-d` | `~/.agentwatch-minimal` | Data directory for session metadata |
-| `--tag` | | (none) | Tag to label sessions |
+| `--tag` | | (none) | Tag stored in metadata (not displayed in UI yet) |
 | `--help` | `-h` | | Show help |
 
 **How it works:**
@@ -254,16 +311,22 @@ bun run orchestrate.ts "complex task" [options]
 **Examples:**
 
 ```bash
-# Decompose and launch
+# Decompose and launch immediately
 bun run orchestrate.ts "Build a REST API with auth, validation, and tests"
 
-# Preview the plan first
+# Preview plan without launching (plan is discarded after display)
 bun run orchestrate.ts "Refactor the payment module" --dry-run
+
+# Preview AND save plan for later reuse
+bun run orchestrate.ts "Refactor the payment module" --dry-run --save-plan ./plan.json
+
+# Run a previously saved plan (skips decomposition)
+bun run orchestrate.ts --plan-file ./plan.json
 
 # Auto-execute dependent tasks when dependencies complete
 bun run orchestrate.ts "Complex multi-step task" --wait
 
-# Save plan to a file
+# Save plan while also launching
 bun run orchestrate.ts "Refactor the payment module" --save-plan ./plan.json
 
 # Reuse a saved plan
@@ -284,7 +347,7 @@ bun run hooks.ts [options]
 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
-| `--port` | `-p` | `8750` | Server port |
+| `--port` | `-p` | `8702` | Server port |
 | `--data-dir` | `-d` | `~/.agentwatch-minimal` | Directory for hook logs |
 | `--notify-desktop` | | `false` | Send desktop notifications |
 | `--notify-webhook` | | (none) | Send webhooks to URL |
@@ -331,7 +394,7 @@ bun run hooks-watch.ts [options]
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--source` | | `file` | Source: "file" (JSONL) or "server" (HTTP) |
-| `--port` | `-p` | `8750` | Hooks server port (for server source) |
+| `--port` | `-p` | `8702` | Hooks server port (for server source) |
 | `--data-dir` | `-d` | `~/.agentwatch-minimal` | Data directory (for file source) |
 | `--limit` | `-n` | `20` | Number of recent hooks to show |
 | `--filter` | `-f` | (none) | Filter by event type |
@@ -370,7 +433,7 @@ Add to `~/.claude/settings.json` to send hooks to watch.ts:
       {
         "hooks": [{
           "type": "command",
-          "command": "curl -sS -X POST http://localhost:8750/hooks/pre-tool-use -H 'Content-Type: application/json' -d @-"
+          "command": "curl -sS -X POST http://localhost:8702/hooks/pre-tool-use -H 'Content-Type: application/json' -d @-"
         }]
       }
     ],
@@ -378,7 +441,7 @@ Add to `~/.claude/settings.json` to send hooks to watch.ts:
       {
         "hooks": [{
           "type": "command",
-          "command": "curl -sS -X POST http://localhost:8750/hooks/post-tool-use -H 'Content-Type: application/json' -d @-"
+          "command": "curl -sS -X POST http://localhost:8702/hooks/post-tool-use -H 'Content-Type: application/json' -d @-"
         }]
       }
     ]

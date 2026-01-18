@@ -55,7 +55,7 @@ describe("types", () => {
     expect(DEFAULT_SESSION_PREFIX).toBe("awm");
   });
 
-  test("DEFAULT_HOOKS_PORT is 8750", () => {
-    expect(DEFAULT_HOOKS_PORT).toBe(8750);
+  test("DEFAULT_HOOKS_PORT is 8702", () => {
+    expect(DEFAULT_HOOKS_PORT).toBe(8702);
   });
 });
