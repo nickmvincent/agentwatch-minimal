@@ -52,6 +52,11 @@ function isAgentCommand(cmd: string | undefined): boolean {
 
 type SortMode = "name" | "created" | "activity";
 
+const REFRESH_PRESETS = [1000, 2000, 5000, 10000] as const;
+const NOTIFY_FILTER_PRESETS: (string[] | undefined)[] = [
+  undefined, ["pre-tool-use"], ["post-tool-use"], ["error"]
+];
+
 type FocusPanel = "sessions" | "hooks";
 
 // State for the unified TUI
@@ -178,6 +183,14 @@ function getEventColor(event: string): string {
   return EVENT_COLORS[event] || ANSI.blue;
 }
 
+function formatNotifyFilter(filter: string[] | undefined): string {
+  if (!filter || filter.length === 0) return "all";
+  if (filter.includes("pre-tool-use")) return "pre";
+  if (filter.includes("post-tool-use")) return "post";
+  if (filter.includes("error")) return "err";
+  return `${filter.length}`;
+}
+
 function renderHelp(): string {
   return `
 ${ANSI.bold}Keybindings${ANSI.reset}
@@ -190,13 +203,19 @@ ${ANSI.dim}${"─".repeat(50)}${ANSI.reset}
   Enter    Attach to session / view hook detail
   Esc      Close detail view
 
-  ${ANSI.cyan}Display${ANSI.reset}
+  ${ANSI.cyan}Display Toggles${ANSI.reset}
   l        Toggle last line output
   s        Toggle CPU/memory stats
   f        Toggle agents-only filter
   e        Toggle expand all sessions
   h        Toggle hooks panel
   r        Refresh now
+
+  ${ANSI.cyan}Runtime Options${ANSI.reset}
+  S        Cycle sort mode (none → name → created → activity)
+  R        Cycle refresh interval (1s → 2s → 5s → 10s)
+  N        Toggle desktop notifications
+  F        Cycle notify filter (all → pre → post → error)
 
   ${ANSI.cyan}Actions${ANSI.reset}
   x        Kill selected session
@@ -597,7 +616,7 @@ async function renderDisplay(state: WatchState): Promise<string> {
 
   // Calculate available lines for sessions panel
   const termHeight = process.stdout.rows || 24;
-  const headerLines = 4;  // header, indicators, separator, blank
+  const headerLines = 6;  // header, indicators, runtime options, info bar, separator, blank
   const footerLines = 2;  // footer + blank
   const hooksHeaderLines = 3;  // if hooks panel shown
   const availableLines = termHeight - headerLines - footerLines;
@@ -616,6 +635,23 @@ async function renderDisplay(state: WatchState): Promise<string> {
   if (showHooks) indicators.push(`${ANSI.green}H${ANSI.reset}`);
 
   output += `${ANSI.dim}[${indicators.join("")}] l:line s:stats f:filter e:expand h:hooks d:done ?:help q:quit${ANSI.reset}\n`;
+
+  // Runtime options bar
+  const sortLabelShort = state.sortBy?.slice(0, 3) ?? "--";
+  const intervalLabel = `${state.intervalMs / 1000}s`;
+  const notifyLabel = state.notifyConfig.desktop ? "on" : "off";
+  const filterLabel = formatNotifyFilter(state.notifyConfig.filter);
+
+  output += `${ANSI.dim}[S:${sortLabelShort}] [R:${intervalLabel}] [N:${notifyLabel}]`;
+  if (state.notifyConfig.desktop) output += ` [F:${filterLabel}]`;
+  output += ` S:sort R:refresh N:notify`;
+  if (state.notifyConfig.desktop) output += ` F:filter`;
+  output += `${ANSI.reset}\n`;
+
+  // Info bar
+  const shortDir = state.dataDir.replace(process.env.HOME || "~", "~");
+  output += `${ANSI.dim}data:${shortDir} | hooks::${state.hooksPort} | sessions:${state.sessions.length}${ANSI.reset}\n`;
+
   output += `${ANSI.dim}${"─".repeat(70)}${ANSI.reset}\n\n`;
 
   // Collect pane data (only for expanded sessions to save resources)
@@ -962,6 +998,24 @@ async function interactiveLoop(state: WatchState): Promise<void> {
         await markSessionDone(state, session);
         needsRefresh = true;
       }
+    } else if (key === "S") {
+      const modes: (SortMode | undefined)[] = [undefined, "name", "created", "activity"];
+      const idx = modes.indexOf(state.sortBy);
+      state.sortBy = modes[(idx + 1) % modes.length];
+      needsRefresh = true;
+    } else if (key === "R") {
+      const idx = REFRESH_PRESETS.indexOf(state.intervalMs as typeof REFRESH_PRESETS[number]);
+      state.intervalMs = REFRESH_PRESETS[(idx + 1) % REFRESH_PRESETS.length];
+      needsRefresh = true;
+    } else if (key === "N") {
+      state.notifyConfig.desktop = !state.notifyConfig.desktop;
+      needsRefresh = true;
+    } else if (key === "F" && state.notifyConfig.desktop) {
+      const idx = NOTIFY_FILTER_PRESETS.findIndex(p =>
+        JSON.stringify(p) === JSON.stringify(state.notifyConfig.filter)
+      );
+      state.notifyConfig.filter = NOTIFY_FILTER_PRESETS[(idx + 1) % NOTIFY_FILTER_PRESETS.length];
+      needsRefresh = true;
     }
   });
 
