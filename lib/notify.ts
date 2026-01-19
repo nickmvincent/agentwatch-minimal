@@ -56,20 +56,31 @@ export async function sendWebhookNotification(
   }
 }
 
+/** Extract last directory name from a path */
+function getLastDirName(path: string): string {
+  const parts = path.split("/");
+  return parts[parts.length - 1] || parts[parts.length - 2] || "";
+}
+
 /** Format a hook entry for notification */
 export function formatHookNotification(hook: HookEntry): { title: string; message: string } {
-  const title = `agentwatch: ${hook.event}`;
+  const payload = hook.payload;
+
+  // Include cwd directory name in title if available
+  const dirName = payload.cwd ? getLastDirName(String(payload.cwd)) : "";
+  const title = dirName ? `${dirName}: ${hook.event}` : `agentwatch: ${hook.event}`;
 
   // Extract useful info from payload
   let message = "";
-  const payload = hook.payload;
 
   if (payload.tool_name) {
     const tool = payload.tool_name as string;
     const input = payload.tool_input as Record<string, unknown> | undefined;
 
     if (input?.file_path) {
-      message = `${tool}: ${input.file_path}`;
+      // Show just filename for brevity in notifications
+      const fileName = getLastDirName(String(input.file_path));
+      message = `${tool}: ${fileName}`;
     } else if (input?.command) {
       message = `${tool}: ${String(input.command).slice(0, 50)}`;
     } else if (input?.pattern) {
