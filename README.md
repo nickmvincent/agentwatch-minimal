@@ -137,17 +137,16 @@ Add to `~/.zshrc` or `~/.bashrc` for quick access:
 # Base path (adjust to your install location)
 AWM_PATH="$HOME/projects/agentwatch-minimal"
 
-# Quick launch
-alias awm="bun run $AWM_PATH/launch.ts"
-alias awm2="bun run $AWM_PATH/launch.ts --agents claude,codex"
-alias awm-all="bun run $AWM_PATH/launch.ts --agents claude,codex,gemini"
+# Launch agents
+alias a="bun run $AWM_PATH/launch.ts"
+alias a2="bun run $AWM_PATH/launch.ts --agents claude,codex"
+alias a3="bun run $AWM_PATH/launch.ts --agents claude,codex,gemini"
 
 # Watch sessions + hooks (unified TUI)
-alias awm-watch="bun run $AWM_PATH/watch.ts --filter awm"
-alias awm-w="awm-watch --last-line --stats"
+alias awm-w="bun run $AWM_PATH/watch.ts"
 
 # Hooks server only (daemon mode)
-alias awm-hooks="bun run $AWM_PATH/watch.ts --hooks-daemon"
+alias awm-h="bun run $AWM_PATH/watch.ts --hooks-daemon"
 
 # Orchestrate
 alias awm-orch="bun run $AWM_PATH/orchestrate.ts"
@@ -157,7 +156,7 @@ alias awm-orch="bun run $AWM_PATH/orchestrate.ts"
 
 ```bash
 # Compare claude and codex on same task
-awm2 "Fix the authentication bug in src/auth.ts"
+a2 "Fix the authentication bug in src/auth.ts"
 
 # Watch them work (in another terminal)
 awm-w
