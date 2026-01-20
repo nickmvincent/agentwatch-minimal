@@ -13,7 +13,7 @@ import {
 } from "./lib/tmux";
 import { createId } from "./lib/ids";
 import { appendJsonl, readJsonlTail, expandHome } from "./lib/jsonl";
-import { notifyHook, type NotificationConfig } from "./lib/notify";
+import { notifyHook, type NotificationConfig, DEFAULT_TITLE_TEMPLATE, DEFAULT_MESSAGE_TEMPLATE } from "./lib/notify";
 import type { TmuxSessionInfo, ProcessStats, HookEntry, SessionMetaEntry } from "./lib/types";
 import { DEFAULT_HOOKS_PORT, DEFAULT_DATA_DIR } from "./lib/types";
 import { appendSessionMeta, buildSessionMetaMap, readSessionMeta } from "./lib/sessions";
@@ -54,12 +54,26 @@ type SortMode = "name" | "created" | "activity";
 
 const REFRESH_PRESETS = [1000, 2000, 5000, 10000] as const;
 
-// Filter popup options
+// Filter popup options - all Claude Code hook event types
 const FILTER_OPTIONS = [
-  { key: "pre-tool-use", label: "pre-tool-use", short: "pre" },
-  { key: "post-tool-use", label: "post-tool-use", short: "post" },
-  { key: "error", label: "error", short: "err" },
-  { key: "notification", label: "notification", short: "notif" },
+  // Tool-related events
+  { key: "PreToolUse", label: "PreToolUse", short: "pre" },
+  { key: "PostToolUse", label: "PostToolUse", short: "post" },
+  { key: "PostToolUseFailure", label: "PostToolUseFailure", short: "fail" },
+  { key: "PermissionRequest", label: "PermissionRequest", short: "perm" },
+  // Session lifecycle
+  { key: "SessionStart", label: "SessionStart", short: "start" },
+  { key: "SessionEnd", label: "SessionEnd", short: "end" },
+  { key: "Stop", label: "Stop", short: "stop" },
+  { key: "SubagentStop", label: "SubagentStop", short: "sub" },
+  // User interaction
+  { key: "UserPromptSubmit", label: "UserPromptSubmit", short: "prompt" },
+  { key: "Notification", label: "Notification", short: "notif" },
+  // Legacy lowercase variants (some setups may use these)
+  { key: "pre-tool-use", label: "pre-tool-use (legacy)", short: "pre-" },
+  { key: "post-tool-use", label: "post-tool-use (legacy)", short: "post-" },
+  { key: "error", label: "error (legacy)", short: "err" },
+  { key: "notification", label: "notification (legacy)", short: "notif-" },
 ] as const;
 
 type FocusPanel = "sessions" | "hooks";
@@ -76,6 +90,10 @@ type WatchState = {
   showFilterPopup: boolean;  // true = show notification filter selector
   filterPopupIndex: number;  // cursor position in filter popup
   filterPopupSelected: Set<string>;  // temporarily selected filters
+  showTemplateEditor: boolean;  // true = show template editor popup
+  templateEditorField: "title" | "message";  // which field is being edited
+  templateEditorValue: string;  // current edit buffer
+  templateEditorCursor: number;  // cursor position in the edit field
   showHooks: boolean;
   showHookDetail: boolean;  // true = show full detail of selected hook
   agentsOnly: boolean;
@@ -226,6 +244,7 @@ ${ANSI.dim}${"─".repeat(50)}${ANSI.reset}
   R        Cycle refresh interval (1s → 2s → 5s → 10s)
   N        Toggle desktop notifications
   F        Select notification filter
+  T        Edit notification templates
 
   ${ANSI.cyan}Actions${ANSI.reset}
   x        Kill selected session
@@ -397,6 +416,8 @@ ${ANSI.bold}Notifications${ANSI.reset}
   --notify-desktop      Enable desktop notifications
   --notify-webhook URL  Forward to webhook URL
   --notify-filter LIST  Comma-separated event types
+  --notify-title-template TPL    Custom title template (e.g. "{dir}: {event}")
+  --notify-message-template TPL  Custom message template (e.g. "{tool}: {detail}")
 
 ${ANSI.bold}Other${ANSI.reset}
   -i, --interval MS     Refresh interval (default: 2000)
@@ -492,6 +513,61 @@ function renderFilterPopup(state: WatchState): string {
   output += `${ANSI.dim}Current: ${preview}${ANSI.reset}\n\n`;
 
   output += `${ANSI.dim}↑↓/jk:move  Space:toggle  Enter:apply  Esc:cancel${ANSI.reset}`;
+  return output;
+}
+
+function renderTemplateEditor(state: WatchState): string {
+  let output = "";
+  output += `${ANSI.bold}Notification Templates${ANSI.reset}\n`;
+  output += `${ANSI.dim}${"─".repeat(50)}${ANSI.reset}\n\n`;
+
+  // Show available placeholders
+  output += `${ANSI.dim}Available placeholders:${ANSI.reset}\n`;
+  output += `${ANSI.dim}  {dir}     - directory name from cwd${ANSI.reset}\n`;
+  output += `${ANSI.dim}  {event}   - hook event type${ANSI.reset}\n`;
+  output += `${ANSI.dim}  {tool}    - tool name (if tool event)${ANSI.reset}\n`;
+  output += `${ANSI.dim}  {file}    - filename (if file operation)${ANSI.reset}\n`;
+  output += `${ANSI.dim}  {cmd}     - command (if Bash, truncated)${ANSI.reset}\n`;
+  output += `${ANSI.dim}  {pattern} - pattern (if Grep/Glob)${ANSI.reset}\n`;
+  output += `${ANSI.dim}  {message} - notification message${ANSI.reset}\n`;
+  output += `${ANSI.dim}  {prompt}  - user prompt (if UserPromptSubmit)${ANSI.reset}\n`;
+  output += `${ANSI.dim}  {reason}  - stop reason (if Stop event)${ANSI.reset}\n`;
+  output += `${ANSI.dim}  {session} - truncated session ID${ANSI.reset}\n`;
+  output += `${ANSI.dim}  {detail}  - smart default (best available info)${ANSI.reset}\n\n`;
+
+  output += `${ANSI.dim}${"─".repeat(50)}${ANSI.reset}\n\n`;
+
+  // Title template
+  const titleActive = state.templateEditorField === "title";
+  const titleValue = titleActive ? state.templateEditorValue : (state.notifyConfig.titleTemplate || DEFAULT_TITLE_TEMPLATE);
+  const titleLabel = titleActive ? `${ANSI.yellow}▶${ANSI.reset} ${ANSI.bold}Title:${ANSI.reset}` : `  ${ANSI.dim}Title:${ANSI.reset}`;
+
+  if (titleActive) {
+    // Show cursor in the edit field
+    const beforeCursor = titleValue.slice(0, state.templateEditorCursor);
+    const afterCursor = titleValue.slice(state.templateEditorCursor);
+    output += `${titleLabel} ${beforeCursor}${ANSI.inverse} ${ANSI.reset}${afterCursor}\n`;
+  } else {
+    output += `${titleLabel} ${ANSI.dim}${titleValue}${ANSI.reset}\n`;
+  }
+
+  output += "\n";
+
+  // Message template
+  const msgActive = state.templateEditorField === "message";
+  const msgValue = msgActive ? state.templateEditorValue : (state.notifyConfig.messageTemplate || DEFAULT_MESSAGE_TEMPLATE);
+  const msgLabel = msgActive ? `${ANSI.yellow}▶${ANSI.reset} ${ANSI.bold}Message:${ANSI.reset}` : `  ${ANSI.dim}Message:${ANSI.reset}`;
+
+  if (msgActive) {
+    const beforeCursor = msgValue.slice(0, state.templateEditorCursor);
+    const afterCursor = msgValue.slice(state.templateEditorCursor);
+    output += `${msgLabel} ${beforeCursor}${ANSI.inverse} ${ANSI.reset}${afterCursor}\n`;
+  } else {
+    output += `${msgLabel} ${ANSI.dim}${msgValue}${ANSI.reset}\n`;
+  }
+
+  output += `\n${ANSI.dim}${"─".repeat(50)}${ANSI.reset}\n`;
+  output += `${ANSI.dim}Tab:switch field  Enter:save  Esc:cancel  Ctrl+R:reset${ANSI.reset}`;
   return output;
 }
 
@@ -881,6 +957,10 @@ async function renderDisplay(state: WatchState): Promise<string> {
     return renderFilterPopup(state);
   }
 
+  if (state.showTemplateEditor) {
+    return renderTemplateEditor(state);
+  }
+
   if (showHookDetail) {
     return renderHookDetail(state);
   }
@@ -919,7 +999,7 @@ async function renderDisplay(state: WatchState): Promise<string> {
   output += `${ANSI.dim}[S:${sortLabelShort}] [R:${intervalLabel}] [N:${notifyLabel}]`;
   if (state.notifyConfig.desktop) output += ` [F:${filterLabel}]`;
   output += ` S:sort R:refresh N:notify`;
-  if (state.notifyConfig.desktop) output += ` F:filter`;
+  if (state.notifyConfig.desktop) output += ` F:filter T:template`;
   output += `${ANSI.reset}\n`;
 
   // Info bar
@@ -1166,6 +1246,11 @@ async function interactiveLoop(state: WatchState): Promise<void> {
 
     // Escape closes detail view or help
     if (key === "\x1b" || key === "\x1b\x1b") {
+      if (state.showTemplateEditor) {
+        state.showTemplateEditor = false;
+        needsRefresh = true;
+        return;
+      }
       if (state.showFilterPopup) {
         state.showFilterPopup = false;
         needsRefresh = true;
@@ -1216,6 +1301,68 @@ async function interactiveLoop(state: WatchState): Promise<void> {
         needsRefresh = true;
       } else if (key === "q") {
         state.showFilterPopup = false;
+        needsRefresh = true;
+      }
+      return;
+    }
+
+    // Template editor - Tab to switch fields, Enter to save, text editing
+    if (state.showTemplateEditor) {
+      if (key === "\t") {
+        // Save current field and switch
+        if (state.templateEditorField === "title") {
+          state.notifyConfig.titleTemplate = state.templateEditorValue || undefined;
+          state.templateEditorField = "message";
+          state.templateEditorValue = state.notifyConfig.messageTemplate || DEFAULT_MESSAGE_TEMPLATE;
+        } else {
+          state.notifyConfig.messageTemplate = state.templateEditorValue || undefined;
+          state.templateEditorField = "title";
+          state.templateEditorValue = state.notifyConfig.titleTemplate || DEFAULT_TITLE_TEMPLATE;
+        }
+        state.templateEditorCursor = state.templateEditorValue.length;
+        needsRefresh = true;
+      } else if (key === "\r" || key === "\n") {
+        // Save both templates
+        if (state.templateEditorField === "title") {
+          state.notifyConfig.titleTemplate = state.templateEditorValue || undefined;
+        } else {
+          state.notifyConfig.messageTemplate = state.templateEditorValue || undefined;
+        }
+        state.showTemplateEditor = false;
+        needsRefresh = true;
+      } else if (key === "\x12") {  // Ctrl+R - reset to defaults
+        state.notifyConfig.titleTemplate = undefined;
+        state.notifyConfig.messageTemplate = undefined;
+        state.templateEditorValue = state.templateEditorField === "title" ? DEFAULT_TITLE_TEMPLATE : DEFAULT_MESSAGE_TEMPLATE;
+        state.templateEditorCursor = state.templateEditorValue.length;
+        needsRefresh = true;
+      } else if (key === "\x7f" || key === "\b") {  // Backspace
+        if (state.templateEditorCursor > 0) {
+          state.templateEditorValue =
+            state.templateEditorValue.slice(0, state.templateEditorCursor - 1) +
+            state.templateEditorValue.slice(state.templateEditorCursor);
+          state.templateEditorCursor--;
+          needsRefresh = true;
+        }
+      } else if (key === "\x1b[D") {  // Left arrow
+        if (state.templateEditorCursor > 0) {
+          state.templateEditorCursor--;
+          needsRefresh = true;
+        }
+      } else if (key === "\x1b[D" || key === "\x1b[C") {  // Right arrow
+        if (key === "\x1b[C" && state.templateEditorCursor < state.templateEditorValue.length) {
+          state.templateEditorCursor++;
+          needsRefresh = true;
+        }
+      } else if (key === "q") {
+        state.showTemplateEditor = false;
+        needsRefresh = true;
+      } else if (code >= 32 && code < 127) {  // Printable ASCII
+        state.templateEditorValue =
+          state.templateEditorValue.slice(0, state.templateEditorCursor) +
+          key +
+          state.templateEditorValue.slice(state.templateEditorCursor);
+        state.templateEditorCursor++;
         needsRefresh = true;
       }
       return;
@@ -1355,6 +1502,13 @@ async function interactiveLoop(state: WatchState): Promise<void> {
       state.filterPopupIndex = 0;
       state.filterPopupSelected = new Set(state.notifyConfig.filter ?? []);
       needsRefresh = true;
+    } else if (key === "T" && state.notifyConfig.desktop) {
+      // Open template editor
+      state.showTemplateEditor = true;
+      state.templateEditorField = "title";
+      state.templateEditorValue = state.notifyConfig.titleTemplate || DEFAULT_TITLE_TEMPLATE;
+      state.templateEditorCursor = state.templateEditorValue.length;
+      needsRefresh = true;
     }
   });
 
@@ -1439,6 +1593,8 @@ async function main() {
       "notify-desktop": { type: "boolean" },
       "notify-webhook": { type: "string" },
       "notify-filter": { type: "string" },
+      "notify-title-template": { type: "string" },
+      "notify-message-template": { type: "string" },
       once: { type: "boolean", short: "o" },
       "no-interactive": { type: "boolean" },
       help: { type: "boolean", short: "h" },
@@ -1469,6 +1625,8 @@ Options:
   --notify-desktop    Send desktop notifications for hooks
   --notify-webhook    Send webhooks to URL for each hook
   --notify-filter     Comma-separated events to notify
+  --notify-title-template     Custom title template (placeholders: {dir}, {event}, etc.)
+  --notify-message-template   Custom message template (placeholders: {tool}, {detail}, etc.)
 
   -o, --once          Run once and exit (no refresh loop)
   --no-interactive    Disable interactive mode
@@ -1522,6 +1680,10 @@ Examples:
     showFilterPopup: false,
     filterPopupIndex: 0,
     filterPopupSelected: new Set(),
+    showTemplateEditor: false,
+    templateEditorField: "title",
+    templateEditorValue: "",
+    templateEditorCursor: 0,
     showHooks: hooksEnabled,
     showHookDetail: false,
     agentsOnly: !values.all,       // ON by default (filter to agents), --all or -A to show all
@@ -1545,6 +1707,8 @@ Examples:
       desktop: values["notify-desktop"] ?? false,
       webhook: values["notify-webhook"],
       filter: values["notify-filter"]?.split(",").map((s) => s.trim()),
+      titleTemplate: values["notify-title-template"],
+      messageTemplate: values["notify-message-template"],
     },
   };
 
