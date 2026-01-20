@@ -16,7 +16,7 @@ import { appendJsonl, readJsonlTail, expandHome } from "./lib/jsonl";
 import { notifyHook, type NotificationConfig, DEFAULT_TITLE_TEMPLATE, DEFAULT_MESSAGE_TEMPLATE } from "./lib/notify";
 import type { TmuxSessionInfo, ProcessStats, HookEntry, SessionMetaEntry } from "./lib/types";
 import { DEFAULT_HOOKS_PORT, DEFAULT_DATA_DIR } from "./lib/types";
-import { appendSessionMeta, buildSessionMetaMap, readSessionMeta } from "./lib/sessions";
+import { appendSessionMeta, buildSessionMetaMap, readSessionMeta, markSessionDone } from "./lib/sessions";
 
 const ANSI = {
   clear: "\x1b[2J\x1b[H",
@@ -980,27 +980,35 @@ async function renderDisplay(state: WatchState): Promise<string> {
   const sortLabel = sortBy ? ` ${ANSI.dim}sort:${sortBy}${ANSI.reset}` : "";
   output += `${ANSI.bold}agentwatch${ANSI.reset} ${ANSI.dim}${now}${ANSI.reset}${sortLabel}\n`;
 
-  // Status indicators
-  const indicators = [];
-  if (showLastLine) indicators.push(`${ANSI.green}L${ANSI.reset}`);
-  if (showStats) indicators.push(`${ANSI.green}S${ANSI.reset}`);
-  if (agentsOnly) indicators.push(`${ANSI.magenta}F${ANSI.reset}`);
-  if (expandAll) indicators.push(`${ANSI.green}E${ANSI.reset}`);
-  if (showHooks) indicators.push(`${ANSI.green}H${ANSI.reset}`);
+  // Helper for on/off indicators with color
+  const onOff = (isOn: boolean) => isOn
+    ? `${ANSI.green}[on]${ANSI.reset}`
+    : `${ANSI.dim}[off]${ANSI.reset}`;
 
-  output += `${ANSI.dim}[${indicators.join("")}] l:line s:stats f:filter e:expand h:hooks D:done ?:help q:quit${ANSI.reset}\n`;
+  // Display toggles line (lowercase keys)
+  output += `l:last-line ${onOff(showLastLine)}  `;
+  output += `s:stats ${onOff(showStats)}  `;
+  output += `f:agents-only ${onOff(agentsOnly)}  `;
+  output += `e:expand-all ${onOff(expandAll)}  `;
+  output += `h:hooks ${onOff(showHooks)}\n`;
 
-  // Runtime options bar
-  const sortLabelShort = state.sortBy?.slice(0, 3) ?? "--";
+  // Runtime options line (uppercase keys)
+  const sortDisplayLabel = state.sortBy ?? "none";
+  const sortColor = state.sortBy ? ANSI.green : ANSI.dim;
+  output += `S:sort ${sortColor}[${sortDisplayLabel}]${ANSI.reset}  `;
+
   const intervalLabel = `${state.intervalMs / 1000}s`;
-  const notifyLabel = state.notifyConfig.desktop ? "on" : "off";
-  const filterLabel = formatNotifyFilter(state.notifyConfig.filter);
+  output += `R:refresh ${ANSI.cyan}[${intervalLabel}]${ANSI.reset}  `;
 
-  output += `${ANSI.dim}[S:${sortLabelShort}] [R:${intervalLabel}] [N:${notifyLabel}]`;
-  if (state.notifyConfig.desktop) output += ` [F:${filterLabel}]`;
-  output += ` S:sort R:refresh N:notify`;
-  if (state.notifyConfig.desktop) output += ` F:filter T:template`;
-  output += `${ANSI.reset}\n`;
+  output += `N:notify ${onOff(state.notifyConfig.desktop)}  `;
+
+  if (state.notifyConfig.desktop) {
+    const filterLabel = formatNotifyFilter(state.notifyConfig.filter);
+    output += `F:event-filter ${ANSI.cyan}[${filterLabel}]${ANSI.reset}  `;
+    output += `T:template  `;
+  }
+
+  output += `${ANSI.dim}D:done ?:help q:quit${ANSI.reset}\n`;
 
   // Info bar
   const shortDir = state.dataDir.replace(process.env.HOME || "~", "~");
