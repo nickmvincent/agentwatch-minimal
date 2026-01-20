@@ -2,6 +2,7 @@ import { parseArgs } from "util";
 import { listSessions, killSession } from "./lib/tmux";
 import { readSessionMeta, buildSessionMetaMap, markSessionDone } from "./lib/sessions";
 import { readJsonlTail, expandHome } from "./lib/jsonl";
+import { formatHookPayload } from "./lib/hooks";
 import { DEFAULT_HOOKS_PORT, DEFAULT_DATA_DIR } from "./lib/types";
 import type { HookEntry, SessionMetaEntry } from "./lib/types";
 
@@ -284,40 +285,6 @@ function printHooks(hooks: HookEntry[]): void {
     const payload = formatHookPayload(h.payload);
     console.log(`${time} ${h.event.padEnd(15)} ${payload}`);
   }
-}
-
-function formatHookPayload(payload: Record<string, unknown>): string {
-  const parts: string[] = [];
-
-  if (payload.cwd) {
-    const cwdParts = String(payload.cwd).split("/");
-    const lastDir = cwdParts[cwdParts.length - 1] || cwdParts[cwdParts.length - 2] || "";
-    if (lastDir) parts.push(lastDir);
-  }
-
-  if (payload.tool_name) {
-    const tool = payload.tool_name as string;
-    const input = payload.tool_input as Record<string, unknown> | undefined;
-    let toolInfo = tool;
-
-    if (input) {
-      if ((tool === "Read" || tool === "Write" || tool === "Edit") && input.file_path) {
-        const path = String(input.file_path).split("/").pop() || "";
-        toolInfo = `${tool}:${path}`;
-      } else if (tool === "Bash" && input.command) {
-        const cmd = String(input.command).slice(0, 30);
-        toolInfo = `${tool}:${cmd}${String(input.command).length > 30 ? "…" : ""}`;
-      }
-    }
-    parts.push(toolInfo);
-  }
-
-  if (payload.message) {
-    const msg = String(payload.message).slice(0, 40);
-    parts.push(msg + (String(payload.message).length > 40 ? "…" : ""));
-  }
-
-  return parts.join(" ") || JSON.stringify(payload).slice(0, 50);
 }
 
 async function main() {

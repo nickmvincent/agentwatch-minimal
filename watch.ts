@@ -7,13 +7,12 @@ import {
   getProcessStatsBatch,
   detectAgentsBatch,
   killSession,
-  renameSession,
-  hasSession,
   type DetectedAgent,
 } from "./lib/tmux";
 import { createId } from "./lib/ids";
 import { appendJsonl, readJsonlTail, expandHome } from "./lib/jsonl";
 import { notifyHook, type NotificationConfig, DEFAULT_TITLE_TEMPLATE, DEFAULT_MESSAGE_TEMPLATE } from "./lib/notify";
+import { formatHookPayload } from "./lib/hooks";
 import type { TmuxSessionInfo, ProcessStats, HookEntry, SessionMetaEntry } from "./lib/types";
 import { DEFAULT_HOOKS_PORT, DEFAULT_DATA_DIR } from "./lib/types";
 import { appendSessionMeta, buildSessionMetaMap, readSessionMeta, markSessionDone } from "./lib/sessions";
@@ -150,61 +149,6 @@ function formatStats(stats: ProcessStats | undefined): string {
 function formatTimestamp(ts: string): string {
   const date = new Date(ts);
   return date.toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
-}
-
-function formatHookPayload(payload: Record<string, unknown>, maxLen = 50): string {
-  const parts: string[] = [];
-
-  // Extract cwd (last directory name)
-  if (payload.cwd) {
-    const cwdParts = String(payload.cwd).split("/");
-    const lastDir = cwdParts[cwdParts.length - 1] || cwdParts[cwdParts.length - 2] || "";
-    if (lastDir) parts.push(lastDir);
-  }
-
-  // For tool use events, show tool name and relevant input
-  if (payload.tool_name) {
-    const tool = payload.tool_name as string;
-    const input = payload.tool_input as Record<string, unknown> | undefined;
-    let toolInfo = tool;
-
-    if (input) {
-      if ((tool === "Read" || tool === "Write" || tool === "Edit") && input.file_path) {
-        const path = String(input.file_path).split("/").pop() || "";
-        toolInfo = `${tool}:${path}`;
-      } else if (tool === "Bash" && input.command) {
-        const cmd = String(input.command).slice(0, 20);
-        toolInfo = `${tool}:${cmd}${String(input.command).length > 20 ? "…" : ""}`;
-      } else if ((tool === "Grep" || tool === "Glob") && input.pattern) {
-        toolInfo = `${tool}:${String(input.pattern).slice(0, 15)}`;
-      }
-    }
-    parts.push(toolInfo);
-  }
-
-  // For notifications, show message and type
-  if (payload.message) {
-    const msg = String(payload.message).slice(0, 30);
-    parts.push(msg + (String(payload.message).length > 30 ? "…" : ""));
-  }
-
-  if (payload.notification_type) {
-    parts.push(`[${payload.notification_type}]`);
-  }
-
-  // For user prompts, show truncated prompt
-  if (payload.prompt && !payload.tool_name) {
-    const prompt = String(payload.prompt).slice(0, 25);
-    parts.push(`"${prompt}${String(payload.prompt).length > 25 ? "…" : ""}"`);
-  }
-
-  if (parts.length === 0) {
-    const str = JSON.stringify(payload);
-    return str.length <= maxLen ? str : str.slice(0, maxLen - 1) + "…";
-  }
-
-  const result = parts.join(" ");
-  return result.length <= maxLen ? result : result.slice(0, maxLen - 1) + "…";
 }
 
 function getEventColor(event: string): string {
@@ -1273,19 +1217,6 @@ async function attachToSession(sessionName: string): Promise<void> {
   await proc.exited;
 }
 
-async function markSessionDoneTUI(state: WatchState, session: TmuxSessionInfo): Promise<void> {
-  const meta = state.sessionMeta.get(session.name);
-  try {
-    const result = await markSessionDone(state.dataDir, session.name, meta);
-    if (result) {
-      state.sessionMeta.set(result.newName, result.entry);
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Warning: failed to mark session done: ${msg}`);
-  }
-}
-
 async function refreshState(state: WatchState): Promise<void> {
   const sessions = await listSessions(state.filter);
   const sorted = sortSessions(sessions, state.sortBy);
@@ -1559,7 +1490,16 @@ async function interactiveLoop(state: WatchState): Promise<void> {
     } else if (key === "D" && state.focusPanel === "sessions" && state.visibleSessions.length > 0) {
       const session = state.visibleSessions[state.selectedIndex];
       if (session) {
-        await markSessionDoneTUI(state, session);
+        const meta = state.sessionMeta.get(session.name);
+        try {
+          const result = await markSessionDone(state.dataDir, session.name, meta);
+          if (result) {
+            state.sessionMeta.set(result.newName, result.entry);
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Warning: failed to mark session done: ${msg}`);
+        }
         needsRefresh = true;
       }
     } else if (key === "S") {
