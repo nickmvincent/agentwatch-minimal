@@ -766,23 +766,26 @@ function renderSessions(
     return lines.join("\n") + "\n";
   }
 
+  // Reserve 2 lines for scroll indicators (↑ more / ↓ N more)
+  const effectiveMaxLines = Math.max(1, maxLines - 2);
+
   if (selectedLineIndex !== -1) {
     if (selectedLineIndex < scrollOffset) {
       scrollOffset = selectedLineIndex;
-    } else if (selectedLineIndex >= scrollOffset + maxLines) {
-      scrollOffset = selectedLineIndex - maxLines + 1;
+    } else if (selectedLineIndex >= scrollOffset + effectiveMaxLines) {
+      scrollOffset = selectedLineIndex - effectiveMaxLines + 1;
     }
   }
 
-  const maxOffset = Math.max(0, contentCount - maxLines);
+  const maxOffset = Math.max(0, contentCount - effectiveMaxLines);
   scrollOffset = Math.max(0, Math.min(scrollOffset, maxOffset));
   state.scrollOffset = scrollOffset;
 
   // Scroll to keep selection visible
-  const visibleContent = contentLines.slice(scrollOffset, scrollOffset + maxLines);
+  const visibleContent = contentLines.slice(scrollOffset, scrollOffset + effectiveMaxLines);
   const scrollIndicator = scrollOffset > 0 ? `${ANSI.dim}↑ more${ANSI.reset}` : "";
-  const moreBelow = scrollOffset + maxLines < contentLines.length
-    ? `${ANSI.dim}↓ ${contentLines.length - scrollOffset - maxLines} more${ANSI.reset}`
+  const moreBelow = scrollOffset + effectiveMaxLines < contentLines.length
+    ? `${ANSI.dim}↓ ${contentLines.length - scrollOffset - effectiveMaxLines} more${ANSI.reset}`
     : "";
 
   const result = [lines[0], lines[1]];
