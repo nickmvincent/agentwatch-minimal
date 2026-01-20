@@ -1145,9 +1145,102 @@ function createHooksApp(state: WatchState): Hono {
   });
 
   app.get("/hooks/health", (c) => c.json({ ok: true, service: "agentwatch" }));
+
+  // Session management endpoints
+  app.get("/sessions", async (c) => {
+    const filter = c.req.query("filter");
+    const sessions = await listSessions(filter);
+    const entries = await readSessionMeta(state.dataDir).catch(() => []);
+    const metaMap = buildSessionMetaMap(entries);
+
+    const result = sessions.map((s) => ({
+      name: s.name,
+      windows: s.windows,
+      attached: s.attached,
+      created: s.created,
+      activity: s.activity,
+      meta: metaMap.get(s.name) ?? null,
+    }));
+
+    return c.json({ ok: true, sessions: result, total: result.length });
+  });
+
+  app.get("/sessions/:name", async (c) => {
+    const name = c.req.param("name");
+    const sessions = await listSessions();
+    const session = sessions.find((s) => s.name === name);
+    if (!session) {
+      return c.json({ ok: false, error: "Session not found" }, 404);
+    }
+
+    const entries = await readSessionMeta(state.dataDir).catch(() => []);
+    const metaMap = buildSessionMetaMap(entries);
+
+    return c.json({
+      ok: true,
+      session: {
+        name: session.name,
+        windows: session.windows,
+        attached: session.attached,
+        created: session.created,
+        activity: session.activity,
+        windowList: session.windowList,
+        meta: metaMap.get(session.name) ?? null,
+      },
+    });
+  });
+
+  app.post("/sessions/:name/done", async (c) => {
+    const name = c.req.param("name");
+    const sessions = await listSessions();
+    const session = sessions.find((s) => s.name === name);
+    if (!session) {
+      return c.json({ ok: false, error: "Session not found" }, 404);
+    }
+
+    const entries = await readSessionMeta(state.dataDir).catch(() => []);
+    const metaMap = buildSessionMetaMap(entries);
+    const meta = metaMap.get(session.name);
+
+    const result = await markSessionDone(state.dataDir, session.name, meta);
+    if (!result) {
+      return c.json({ ok: false, error: "Failed to mark session done" }, 500);
+    }
+
+    // Update local state
+    state.sessionMeta.set(result.newName, result.entry);
+
+    return c.json({ ok: true, newName: result.newName, entry: result.entry });
+  });
+
+  app.post("/sessions/:name/kill", async (c) => {
+    const name = c.req.param("name");
+    const sessions = await listSessions();
+    const session = sessions.find((s) => s.name === name);
+    if (!session) {
+      return c.json({ ok: false, error: "Session not found" }, 404);
+    }
+
+    const killed = await killSession(session.name);
+    if (!killed) {
+      return c.json({ ok: false, error: "Failed to kill session" }, 500);
+    }
+
+    return c.json({ ok: true, killed: session.name });
+  });
+
   app.get("/", (c) => c.json({
     service: "agentwatch",
-    endpoints: ["POST /hooks/:event", "POST /api/hooks/:event", "GET /hooks/recent", "GET /hooks/health"],
+    endpoints: [
+      "POST /hooks/:event",
+      "POST /api/hooks/:event",
+      "GET /hooks/recent",
+      "GET /hooks/health",
+      "GET /sessions",
+      "GET /sessions/:name",
+      "POST /sessions/:name/done",
+      "POST /sessions/:name/kill",
+    ],
   }));
 
   return app;
@@ -1180,39 +1273,16 @@ async function attachToSession(sessionName: string): Promise<void> {
   await proc.exited;
 }
 
-async function markSessionDone(state: WatchState, session: TmuxSessionInfo): Promise<void> {
-  const oldName = session.name;
-  let newName = oldName;
-  let renamedFrom: string | undefined;
-
-  if (!oldName.endsWith("-done")) {
-    newName = `${oldName}-done`;
-    if (await hasSession(newName)) {
-      newName = `${newName}-${Date.now().toString(36)}`;
-    }
-    const renamed = await renameSession(oldName, newName);
-    if (!renamed) return;
-    renamedFrom = oldName;
-  }
-
-  const meta = state.sessionMeta.get(oldName);
+async function markSessionDoneTUI(state: WatchState, session: TmuxSessionInfo): Promise<void> {
+  const meta = state.sessionMeta.get(session.name);
   try {
-    const entry = await appendSessionMeta(state.dataDir, {
-      sessionName: newName,
-      agent: meta?.agent,
-      promptPreview: meta?.promptPreview,
-      cwd: meta?.cwd,
-      tag: meta?.tag,
-      planId: meta?.planId,
-      taskId: meta?.taskId,
-      status: "done",
-      renamedFrom,
-      source: "watch",
-    });
-    state.sessionMeta.set(newName, entry);
+    const result = await markSessionDone(state.dataDir, session.name, meta);
+    if (result) {
+      state.sessionMeta.set(result.newName, result.entry);
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Warning: failed to write session metadata: ${msg}`);
+    console.error(`Warning: failed to mark session done: ${msg}`);
   }
 }
 
@@ -1489,7 +1559,7 @@ async function interactiveLoop(state: WatchState): Promise<void> {
     } else if (key === "D" && state.focusPanel === "sessions" && state.visibleSessions.length > 0) {
       const session = state.visibleSessions[state.selectedIndex];
       if (session) {
-        await markSessionDone(state, session);
+        await markSessionDoneTUI(state, session);
         needsRefresh = true;
       }
     } else if (key === "S") {

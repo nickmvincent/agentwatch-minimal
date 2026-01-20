@@ -56,3 +56,44 @@ export function buildSessionMetaMap(entries: SessionMetaEntry[]): Map<string, Se
   return map;
 }
 
+/**
+ * Mark a session as done by renaming it with "-done" suffix and updating metadata.
+ * Returns the new session name and metadata entry, or null if the operation failed.
+ */
+export async function markSessionDone(
+  dataDir: string,
+  sessionName: string,
+  existingMeta?: SessionMetaEntry
+): Promise<{ newName: string; entry: SessionMetaEntry } | null> {
+  // Import tmux functions dynamically to avoid circular deps
+  const { hasSession, renameSession } = await import("./tmux");
+
+  let newName = sessionName;
+  let renamedFrom: string | undefined;
+
+  if (!sessionName.endsWith("-done")) {
+    newName = `${sessionName}-done`;
+    if (await hasSession(newName)) {
+      newName = `${newName}-${Date.now().toString(36)}`;
+    }
+    const renamed = await renameSession(sessionName, newName);
+    if (!renamed) return null;
+    renamedFrom = sessionName;
+  }
+
+  const entry = await appendSessionMeta(dataDir, {
+    sessionName: newName,
+    agent: existingMeta?.agent,
+    promptPreview: existingMeta?.promptPreview,
+    cwd: existingMeta?.cwd,
+    tag: existingMeta?.tag,
+    planId: existingMeta?.planId,
+    taskId: existingMeta?.taskId,
+    status: "done",
+    renamedFrom,
+    source: "watch",
+  });
+
+  return { newName, entry };
+}
+
