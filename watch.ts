@@ -78,11 +78,13 @@ const FILTER_OPTIONS = [
 
 type FocusPanel = "sessions" | "hooks";
 
+type LastLineMode = 0 | 1 | 5;  // 0 = off, 1 = 1 line, 5 = 5 lines
+
 // State for the unified TUI
 type WatchState = {
   filter: string | undefined;
   intervalMs: number;
-  showLastLine: boolean;
+  lastLineMode: LastLineMode;
   showStats: boolean;
   showHelp: boolean;
   showDetailedHelp: boolean;  // true = show extended documentation
@@ -649,7 +651,7 @@ function renderSessions(
   detectedAgents: Map<number, DetectedAgent>,
   maxLines: number
 ): string {
-  const { showLastLine, showStats, selectedIndex, filter, agentsOnly, expandAll, focusPanel, showHooks } = state;
+  const { lastLineMode, showStats, selectedIndex, filter, agentsOnly, expandAll, focusPanel, showHooks } = state;
   const sessions = state.visibleSessions;
   let { scrollOffset } = state;
   const now = Math.floor(Date.now() / 1000);
@@ -740,12 +742,12 @@ function renderSessions(
 
         lines.push(`${indent}${paneActive}${cmdStr}${paneAgentStr}${statsStr}${idleStr}`);
 
-        if (showLastLine) {
+        if (lastLineMode > 0) {
           const target = `${session.name}:${window.index}.${pane.paneIndex}`;
           const paneLines = capturedLines.get(target) || [];
           for (const line of paneLines) {
-            const truncated = line.slice(0, 50);
-            lines.push(`${indent} ${ANSI.dim}${truncated}${line.length > 50 ? "…" : ""}${ANSI.reset}`);
+            const truncated = line.slice(0, 60);
+            lines.push(`${indent} ${ANSI.dim}${truncated}${line.length > 60 ? "…" : ""}${ANSI.reset}`);
           }
         }
       }
@@ -883,7 +885,7 @@ function renderHookDetail(state: WatchState): string {
 }
 
 async function renderDisplay(state: WatchState): Promise<string> {
-  const { showLastLine, showStats, showHelp, showDetailedHelp, showFilterPopup, showHooks, showHookDetail, agentsOnly, expandAll, sortBy } = state;
+  const { lastLineMode, showStats, showHelp, showDetailedHelp, showFilterPopup, showHooks, showHookDetail, agentsOnly, expandAll, sortBy } = state;
   const sessions = state.visibleSessions;
 
   if (showDetailedHelp) {
@@ -926,7 +928,8 @@ async function renderDisplay(state: WatchState): Promise<string> {
     : `${ANSI.dim}[off]${ANSI.reset}`;
 
   // Display toggles line (lowercase keys)
-  output += `l:last-line ${onOff(showLastLine)}  `;
+  const lastLineLabel = lastLineMode === 0 ? `${ANSI.dim}[off]${ANSI.reset}` : `${ANSI.green}[${lastLineMode}]${ANSI.reset}`;
+  output += `l:lines ${lastLineLabel}  `;
   output += `s:stats ${onOff(showStats)}  `;
   output += `f:agents-only ${onOff(agentsOnly)}  `;
   output += `e:expand-all ${onOff(expandAll)}  `;
@@ -980,7 +983,7 @@ async function renderDisplay(state: WatchState): Promise<string> {
 
     for (const window of windows) {
       for (const pane of window.panes) {
-        if (showLastLine) {
+        if (lastLineMode > 0) {
           paneTargets.push(`${session.name}:${window.index}.${pane.paneIndex}`);
         }
         if (showStats && pane.panePid) {
@@ -991,7 +994,7 @@ async function renderDisplay(state: WatchState): Promise<string> {
   }
 
   const [capturedLines, processStats, detectedAgents] = await Promise.all([
-    showLastLine ? capturePanesMultiline(paneTargets, 2, 20) : Promise.resolve(new Map<string, string[]>()),
+    lastLineMode > 0 ? capturePanesMultiline(paneTargets, lastLineMode, lastLineMode * 4) : Promise.resolve(new Map<string, string[]>()),
     showStats ? getProcessStatsBatch(panePids) : Promise.resolve(new Map<number, ProcessStats>()),
     pidsNeedingDetection.length > 0 ? detectAgentsBatch(pidsNeedingDetection) : Promise.resolve(new Map<number, DetectedAgent>()),
   ]);
@@ -1444,7 +1447,8 @@ async function interactiveLoop(state: WatchState): Promise<void> {
       state.showHelp = !state.showHelp;
       needsRefresh = true;
     } else if (key === "l") {
-      state.showLastLine = !state.showLastLine;
+      // Cycle: 0 -> 1 -> 5 -> 0
+      state.lastLineMode = state.lastLineMode === 0 ? 1 : state.lastLineMode === 1 ? 5 : 0;
       needsRefresh = true;
     } else if (key === "s") {
       state.showStats = !state.showStats;
@@ -1684,7 +1688,7 @@ Examples:
   const state: WatchState = {
     filter: values.filter,
     intervalMs: parseInt(values.interval!, 10),
-    showLastLine: !values["no-last-line"],  // ON by default
+    lastLineMode: values["no-last-line"] ? 0 : 1,  // 1 line by default
     showStats: !values["no-stats"],          // ON by default
     showHelp: false,
     showDetailedHelp: false,
