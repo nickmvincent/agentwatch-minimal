@@ -877,6 +877,7 @@ function renderHookDetail(state: WatchState): string {
 
 async function renderDisplay(state: WatchState): Promise<string> {
   const { showLastLine, showStats, showHelp, showDetailedHelp, showFilterPopup, showHooks, showHookDetail, agentsOnly, expandAll, sortBy } = state;
+  const sessions = state.visibleSessions;
 
   if (showDetailedHelp) {
     return renderDetailedHelp(state);
