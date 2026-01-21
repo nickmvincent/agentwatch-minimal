@@ -731,7 +731,14 @@ function renderSessions(
           ? ` ${AGENT_COLORS[paneAgent] || ANSI.blue}[${paneAgent}]${ANSI.reset}`
           : "";
 
-        lines.push(`${indent}${paneActive}${cmdStr}${paneAgentStr}${statsStr}`);
+        // Show idle time (dim if idle > 10s, yellow if > 60s)
+        let idleStr = "";
+        if (pane.idleSeconds !== undefined && pane.idleSeconds > 5) {
+          const idleColor = pane.idleSeconds > 60 ? ANSI.yellow : ANSI.dim;
+          idleStr = ` ${idleColor}idle:${formatDuration(pane.idleSeconds)}${ANSI.reset}`;
+        }
+
+        lines.push(`${indent}${paneActive}${cmdStr}${paneAgentStr}${statsStr}${idleStr}`);
 
         if (showLastLine) {
           const target = `${session.name}:${window.index}.${pane.paneIndex}`;
