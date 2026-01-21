@@ -229,7 +229,7 @@ ${ANSI.bold}Line 3: Runtime Options${ANSI.reset}
   - S:xxx = Sort mode (--/nam/cre/act)
   - R:Xs  = Refresh interval (1s/2s/5s/10s)
   - N:on/off = Desktop notifications enabled
-  - F:xxx = Notification filter (all/pre/post/err)
+  - F:xxx = Notification filter (all/pre/post/notif)
 
 ${ANSI.bold}Line 4: Info Bar${ANSI.reset}
   data:~/.agentwatch | hooks::8702 | sessions:N
@@ -556,11 +556,6 @@ function getFilteredWindows(session: TmuxSessionInfo, agentsOnly: boolean) {
   return session.windowList
     .map(w => ({ ...w, panes: w.panes.filter(p => isAgentCommand(p.command)) }))
     .filter(w => w.panes.length > 0);
-}
-
-function countAgentPanes(session: TmuxSessionInfo): number {
-  return session.windowList.reduce((sum, w) =>
-    sum + w.panes.filter(p => isAgentCommand(p.command)).length, 0);
 }
 
 function parseSortMode(input: string | undefined): SortMode | undefined {
@@ -892,7 +887,6 @@ function renderHookDetail(state: WatchState): string {
 
 async function renderDisplay(state: WatchState): Promise<string> {
   const { showLastLine, showStats, showHelp, showDetailedHelp, showFilterPopup, showHooks, showHookDetail, agentsOnly, expandAll, sortBy } = state;
-  const sessions = state.visibleSessions;
 
   if (showDetailedHelp) {
     return renderDetailedHelp(state);
@@ -921,7 +915,6 @@ async function renderDisplay(state: WatchState): Promise<string> {
   const termHeight = process.stdout.rows || 24;
   const headerLines = 6;  // header, indicators, runtime options, info bar, separator, blank
   const footerLines = 2;  // footer + blank
-  const hooksHeaderLines = 3;  // if hooks panel shown
   const availableLines = termHeight - headerLines - footerLines;
   const maxSessionLines = showHooks ? Math.floor(availableLines * 0.7) : availableLines;
 
@@ -1363,8 +1356,8 @@ async function interactiveLoop(state: WatchState): Promise<void> {
           state.templateEditorCursor--;
           needsRefresh = true;
         }
-      } else if (key === "\x1b[D" || key === "\x1b[C") {  // Right arrow
-        if (key === "\x1b[C" && state.templateEditorCursor < state.templateEditorValue.length) {
+      } else if (key === "\x1b[C") {  // Right arrow
+        if (state.templateEditorCursor < state.templateEditorValue.length) {
           state.templateEditorCursor++;
           needsRefresh = true;
         }
@@ -1607,7 +1600,6 @@ async function main() {
       all: { type: "boolean", short: "A" },  // show all sessions, not just agents
       "no-expand": { type: "boolean" },      // collapse sessions by default
       sort: { type: "string" },
-      hooks: { type: "boolean", default: true },
       "hooks-port": { type: "string", default: String(DEFAULT_HOOKS_PORT) },
       "hooks-daemon": { type: "boolean" },
       "no-hooks": { type: "boolean" },
