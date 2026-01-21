@@ -1,9 +1,13 @@
 import { parseArgs } from "util";
 import { createId, createSessionName } from "./lib/ids";
 import { launchAgentSession } from "./lib/tmux";
+import { appendSessionMeta, makePromptPreview, normalizeTag } from "./lib/sessions";
+import { expandHome } from "./lib/jsonl";
+import { readFileSync } from "fs";
 import {
   type AgentType,
   type LaunchedSession,
+  DEFAULT_DATA_DIR,
   DEFAULT_SESSION_PREFIX,
 } from "./lib/types";
 
@@ -28,12 +32,28 @@ async function launchAgent(
   prompt: string,
   cwd: string,
   prefix: string,
+  dataDir: string,
+  tag: string | undefined,
   extraFlags: string[] = []
 ): Promise<LaunchedSession> {
   const sessionName = createSessionName(prefix, agent);
   const id = createId("launch");
 
   await launchAgentSession(agent, prompt, sessionName, cwd, extraFlags);
+
+  try {
+    await appendSessionMeta(dataDir, {
+      sessionName,
+      agent,
+      promptPreview: makePromptPreview(prompt),
+      cwd,
+      tag,
+      source: "launch",
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Warning: failed to write session metadata: ${msg}`);
+  }
 
   return {
     id,
@@ -52,6 +72,9 @@ async function main() {
       agents: { type: "string", short: "a", default: "claude" },
       cwd: { type: "string", short: "c" },
       prefix: { type: "string", short: "p", default: DEFAULT_SESSION_PREFIX },
+      "prompt-file": { type: "string" },
+      "data-dir": { type: "string", short: "d", default: DEFAULT_DATA_DIR },
+      tag: { type: "string" },
       "claude-flags": { type: "string" },
       "codex-flags": { type: "string" },
       "gemini-flags": { type: "string" },
@@ -60,7 +83,7 @@ async function main() {
     allowPositionals: true,
   });
 
-  if (values.help || positionals.length === 0) {
+  if (values.help || (positionals.length === 0 && !values["prompt-file"])) {
     console.log(`agentwatch-minimal launcher
 
 Usage:
@@ -70,6 +93,9 @@ Options:
   -a, --agents        Comma-separated agents: claude,codex,gemini (default: claude)
   -c, --cwd           Working directory for agents
   -p, --prefix        Session name prefix (default: awm)
+  --prompt-file       Read prompt from file ("-" for stdin)
+  -d, --data-dir      Data directory for session metadata (default: ${DEFAULT_DATA_DIR})
+  --tag               Tag to label sessions
   --claude-flags      Extra flags for Claude (e.g., "--dangerously-skip-permissions")
   --codex-flags       Extra flags for Codex (e.g., "--approval-mode full-auto")
   --gemini-flags      Extra flags for Gemini (e.g., "--yolo")
@@ -79,14 +105,31 @@ Examples:
   bun run launch.ts "Fix the auth bug" --agents claude,codex
   bun run launch.ts "Write tests" --agents gemini --gemini-flags "--yolo"
   bun run launch.ts "Refactor" --agents claude,codex --codex-flags "--approval-mode full-auto"
+  bun run launch.ts --prompt-file ./prompt.txt --agents claude
 `);
     process.exit(0);
   }
 
-  const prompt = positionals.join(" ");
+  if (values["prompt-file"] && positionals.length > 0) {
+    console.error("Error: Provide either a prompt string or --prompt-file, not both.");
+    process.exit(1);
+  }
+
+  let prompt = positionals.join(" ");
+  if (values["prompt-file"]) {
+    const inputPath = values["prompt-file"]!;
+    if (inputPath === "-") {
+      prompt = readFileSync(0, "utf8");
+    } else {
+      prompt = await Bun.file(expandHome(inputPath)).text();
+    }
+  }
+
   const agents = parseAgents(values.agents!);
   const cwd = values.cwd ?? process.cwd();
   const prefix = values.prefix!;
+  const dataDir = values["data-dir"]!;
+  const tag = normalizeTag(values.tag);
 
   // Parse agent-specific flags
   const agentFlags: AgentFlags = {
@@ -108,7 +151,9 @@ Examples:
 
   // Launch all agents in parallel
   const results = await Promise.allSettled(
-    agents.map((agent) => launchAgent(agent, prompt, cwd, prefix, agentFlags[agent] || []))
+    agents.map((agent) =>
+      launchAgent(agent, prompt, cwd, prefix, dataDir, tag, agentFlags[agent] || [])
+    )
   );
 
   const launched: LaunchedSession[] = [];

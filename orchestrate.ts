@@ -1,12 +1,18 @@
 import { parseArgs } from "util";
 import { createId, createSessionName } from "./lib/ids";
 import { launchAgentSession, hasSession } from "./lib/tmux";
+import { appendSessionMeta, makePromptPreview, normalizeTag } from "./lib/sessions";
+import { expandHome } from "./lib/jsonl";
 import {
   type AgentType,
   type SubTask,
   type OrchestrationPlan,
+  DEFAULT_DATA_DIR,
   DEFAULT_SESSION_PREFIX,
 } from "./lib/types";
+import { dirname } from "path";
+import { mkdir } from "fs/promises";
+import { readFileSync } from "fs";
 
 const DECOMPOSITION_PROMPT = `You are a task decomposer. Given a complex task, break it down into independent sub-tasks that can be worked on in parallel by different coding agents.
 
@@ -84,14 +90,96 @@ function parseFlags(input: string | undefined): string[] {
   return input.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
 }
 
+async function readPromptInput(promptFile: string): Promise<string> {
+  if (promptFile === "-") {
+    return readFileSync(0, "utf8");
+  }
+  return Bun.file(expandHome(promptFile)).text();
+}
+
+function normalizeAgent(agent: string | undefined, index: number): AgentType {
+  const normalized = (agent ?? "").toLowerCase();
+  if (normalized === "claude" || normalized === "codex" || normalized === "gemini") {
+    return normalized;
+  }
+  throw new Error(`Task ${index + 1} has invalid agent: ${agent}`);
+}
+
+function normalizeTasks(rawTasks: Array<Partial<SubTask> & { agent?: string }>): SubTask[] {
+  return rawTasks.map((task, i) => {
+    if (!task.prompt) {
+      throw new Error(`Task ${i + 1} is missing a prompt`);
+    }
+    return {
+      id: task.id ?? `task_${i + 1}`,
+      description: task.description ?? `task_${i + 1}`,
+      agent: normalizeAgent(task.agent, i),
+      prompt: task.prompt,
+      dependencies: task.dependencies ?? [],
+    };
+  });
+}
+
+async function loadPlanFromFile(
+  filePath: string,
+  fallbackPrompt: string
+): Promise<OrchestrationPlan> {
+  const contents = await Bun.file(expandHome(filePath)).text();
+  const parsed = JSON.parse(contents) as Partial<OrchestrationPlan> | Array<Partial<SubTask>>;
+
+  if (Array.isArray(parsed)) {
+    const tasks = normalizeTasks(parsed);
+    return {
+      id: createId("plan"),
+      originalPrompt: fallbackPrompt || "plan-file",
+      decomposedAt: new Date().toISOString(),
+      tasks,
+      orchestratorAgent: "claude",
+    };
+  }
+
+  const tasks = normalizeTasks(parsed.tasks ?? []);
+  return {
+    id: parsed.id ?? createId("plan"),
+    originalPrompt: parsed.originalPrompt ?? fallbackPrompt || "plan-file",
+    decomposedAt: parsed.decomposedAt ?? new Date().toISOString(),
+    tasks,
+    orchestratorAgent: parsed.orchestratorAgent ?? "claude",
+  };
+}
+
+async function savePlanToFile(plan: OrchestrationPlan, filePath: string): Promise<void> {
+  const expanded = expandHome(filePath);
+  await mkdir(dirname(expanded), { recursive: true });
+  await Bun.write(expanded, JSON.stringify(plan, null, 2));
+}
+
 async function launchSubTask(
   task: SubTask,
   cwd: string,
   prefix: string,
-  agentFlags: AgentFlags = {}
+  agentFlags: AgentFlags = {},
+  dataDir: string,
+  tag: string | undefined,
+  planId: string
 ): Promise<string> {
   const sessionName = createSessionName(prefix, `${task.agent}-${task.id}`);
   await launchAgentSession(task.agent, task.prompt, sessionName, cwd, agentFlags[task.agent] || []);
+  try {
+    await appendSessionMeta(dataDir, {
+      sessionName,
+      agent: task.agent,
+      promptPreview: makePromptPreview(task.prompt),
+      cwd,
+      tag,
+      planId,
+      taskId: task.id,
+      source: "orchestrate",
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Warning: failed to write session metadata: ${msg}`);
+  }
   return sessionName;
 }
 
@@ -105,6 +193,11 @@ async function main() {
       prefix: { type: "string", short: "p", default: DEFAULT_SESSION_PREFIX },
       "dry-run": { type: "boolean", short: "n" },
       wait: { type: "boolean", short: "w" },
+      "prompt-file": { type: "string" },
+      "plan-file": { type: "string" },
+      "save-plan": { type: "string" },
+      "data-dir": { type: "string", short: "d", default: DEFAULT_DATA_DIR },
+      tag: { type: "string" },
       "claude-flags": { type: "string" },
       "codex-flags": { type: "string" },
       "gemini-flags": { type: "string" },
@@ -113,7 +206,10 @@ async function main() {
     allowPositionals: true,
   });
 
-  if (values.help || positionals.length === 0) {
+  const hasPromptInput = positionals.length > 0 || values["prompt-file"];
+  const hasPlanFile = Boolean(values["plan-file"]);
+
+  if (values.help || (!hasPromptInput && !hasPlanFile)) {
     console.log(`agentwatch-minimal orchestrator
 
 Usage:
@@ -124,6 +220,11 @@ Options:
   -p, --prefix        Session name prefix (default: awm)
   -n, --dry-run       Show decomposition plan without launching agents
   -w, --wait          Wait for dependencies and launch dependent tasks automatically
+  --prompt-file       Read task prompt from file ("-" for stdin)
+  --plan-file         Use an existing plan JSON instead of Claude decomposition
+  --save-plan         Save plan JSON to a file
+  -d, --data-dir      Data directory for session metadata (default: ${DEFAULT_DATA_DIR})
+  --tag               Tag to label sessions
   --claude-flags      Extra flags for Claude agents
   --codex-flags       Extra flags for Codex agents
   --gemini-flags      Extra flags for Gemini agents
@@ -133,15 +234,27 @@ Examples:
   bun run orchestrate.ts "Build a REST API with auth, validation, and tests"
   bun run orchestrate.ts "Refactor the payment module" --dry-run
   bun run orchestrate.ts "Complex task" --wait --gemini-flags "--yolo"
+  bun run orchestrate.ts --prompt-file ./task.txt --save-plan ./plan.json
 `);
     process.exit(0);
   }
 
-  const prompt = positionals.join(" ");
+  if (values["prompt-file"] && positionals.length > 0) {
+    console.error("Error: Provide either a prompt string or --prompt-file, not both.");
+    process.exit(1);
+  }
+
+  let prompt = positionals.join(" ");
+  if (values["prompt-file"]) {
+    prompt = await readPromptInput(values["prompt-file"]!);
+  }
+
   const cwd = values.cwd ?? process.cwd();
   const prefix = values.prefix!;
   const dryRun = values["dry-run"] ?? false;
   const waitForDeps = values.wait ?? false;
+  const dataDir = values["data-dir"]!;
+  const tag = normalizeTag(values.tag);
 
   // Parse agent-specific flags
   const agentFlags: AgentFlags = {
@@ -154,27 +267,41 @@ Examples:
   console.log("agentwatch-minimal orchestrator");
   console.log("═".repeat(60));
   console.log();
-  console.log(`Task: "${prompt}"`);
+  if (prompt) {
+    console.log(`Task: "${prompt}"`);
+  } else if (values["plan-file"]) {
+    console.log(`Task: "plan-file"`);
+  }
   console.log(`CWD: ${cwd}`);
   console.log();
 
   // Decompose the task
-  const tasks = await decomposeWithClaude(prompt);
+  let plan: OrchestrationPlan;
+  if (values["plan-file"]) {
+    plan = await loadPlanFromFile(values["plan-file"]!, prompt);
+  } else {
+    const tasks = await decomposeWithClaude(prompt);
+    plan = {
+      id: createId("plan"),
+      originalPrompt: prompt,
+      decomposedAt: new Date().toISOString(),
+      tasks,
+      orchestratorAgent: "claude",
+    };
+  }
 
-  const plan: OrchestrationPlan = {
-    id: createId("plan"),
-    originalPrompt: prompt,
-    decomposedAt: new Date().toISOString(),
-    tasks,
-    orchestratorAgent: "claude",
-  };
+  if (values["save-plan"]) {
+    const savePath = values["save-plan"]!;
+    await savePlanToFile(plan, savePath);
+    console.log(`Saved plan to ${expandHome(savePath)}`);
+  }
 
   console.log("─".repeat(60));
-  console.log(`Decomposed into ${tasks.length} sub-task(s):`);
+  console.log(`Decomposed into ${plan.tasks.length} sub-task(s):`);
   console.log("─".repeat(60));
   console.log();
 
-  for (const task of tasks) {
+  for (const task of plan.tasks) {
     console.log(`[${task.id}] ${task.description}`);
     console.log(`  Agent: ${task.agent}`);
     console.log(`  Prompt: ${task.prompt.slice(0, 80)}${task.prompt.length > 80 ? "..." : ""}`);
@@ -192,10 +319,10 @@ Examples:
   }
 
   // Separate independent and dependent tasks
-  const independent = tasks.filter(
+  const independent = plan.tasks.filter(
     (t) => !t.dependencies || t.dependencies.length === 0
   );
-  const dependent = tasks.filter(
+  const dependent = plan.tasks.filter(
     (t) => t.dependencies && t.dependencies.length > 0
   );
 
@@ -211,7 +338,7 @@ Examples:
 
   // Launch independent tasks in parallel
   const independentResults = await Promise.allSettled(
-    independent.map((task) => launchSubTask(task, cwd, prefix, agentFlags))
+    independent.map((task) => launchSubTask(task, cwd, prefix, agentFlags, dataDir, tag, plan.id))
   );
 
   for (let i = 0; i < independentResults.length; i++) {
@@ -262,7 +389,7 @@ Examples:
             pending.delete(task.id);
             try {
               console.log(`  [${task.id}] dependencies ready, launching...`);
-              const sessionName = await launchSubTask(task, cwd, prefix, agentFlags);
+              const sessionName = await launchSubTask(task, cwd, prefix, agentFlags, dataDir, tag, plan.id);
               launched.set(task.id, sessionName);
               console.log(`  [${task.id}] ${task.description} -> ${sessionName}`);
             } catch (err) {
