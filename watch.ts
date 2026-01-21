@@ -35,10 +35,16 @@ const ANSI = {
 
 // Color map for hook event types
 const EVENT_COLORS: Record<string, string> = {
-  "pre-tool-use": ANSI.cyan,
-  "post-tool-use": ANSI.green,
-  "notification": ANSI.yellow,
-  "error": ANSI.red,
+  PreToolUse: ANSI.cyan,
+  PostToolUse: ANSI.green,
+  PostToolUseFailure: ANSI.red,
+  PermissionRequest: ANSI.yellow,
+  SessionStart: ANSI.green,
+  SessionEnd: ANSI.dim,
+  Stop: ANSI.red,
+  SubagentStop: ANSI.red,
+  UserPromptSubmit: ANSI.blue,
+  Notification: ANSI.yellow,
 };
 
 // Known agent process names
@@ -68,11 +74,6 @@ const FILTER_OPTIONS = [
   // User interaction
   { key: "UserPromptSubmit", label: "UserPromptSubmit", short: "prompt" },
   { key: "Notification", label: "Notification", short: "notif" },
-  // Legacy lowercase variants (some setups may use these)
-  { key: "pre-tool-use", label: "pre-tool-use (legacy)", short: "pre-" },
-  { key: "post-tool-use", label: "post-tool-use (legacy)", short: "post-" },
-  { key: "error", label: "error (legacy)", short: "err" },
-  { key: "notification", label: "notification (legacy)", short: "notif-" },
 ] as const;
 
 type FocusPanel = "sessions" | "hooks";
@@ -157,9 +158,9 @@ function getEventColor(event: string): string {
 
 function formatNotifyFilter(filter: string[] | undefined): string {
   if (!filter || filter.length === 0) return "all";
-  if (filter.includes("pre-tool-use")) return "pre";
-  if (filter.includes("post-tool-use")) return "post";
-  if (filter.includes("error")) return "err";
+  if (filter.includes("PreToolUse")) return "pre";
+  if (filter.includes("PostToolUse")) return "post";
+  if (filter.includes("Notification")) return "notif";
   return `${filter.length}`;
 }
 
@@ -277,9 +278,9 @@ Press ${ANSI.bold}F${ANSI.reset} to open filter selector (only when N:on).
 
 Filter options:
   ${ANSI.cyan}all${ANSI.reset}   : Notify on all hook events
-  ${ANSI.cyan}pre${ANSI.reset}   : Only pre-tool-use events
-  ${ANSI.cyan}post${ANSI.reset}  : Only post-tool-use events
-  ${ANSI.cyan}error${ANSI.reset} : Only error events
+  ${ANSI.cyan}pre${ANSI.reset}   : Only PreToolUse events
+  ${ANSI.cyan}post${ANSI.reset}  : Only PostToolUse events
+  ${ANSI.cyan}notif${ANSI.reset} : Only Notification events
 
 Use arrow keys to select, Enter to confirm, Esc to cancel.`,
   },
@@ -292,10 +293,11 @@ The hooks panel shows recent webhook events received on the
 embedded server (default port 8702).
 
 ${ANSI.bold}Hook Types:${ANSI.reset}
-  ${ANSI.cyan}pre${ANSI.reset}   : Before tool execution (cyan)
-  ${ANSI.green}post${ANSI.reset}  : After tool execution (green)
-  ${ANSI.yellow}notif${ANSI.reset} : Notification events (yellow)
-  ${ANSI.red}error${ANSI.reset} : Error events (red)
+  ${ANSI.cyan}PreToolUse${ANSI.reset}        : Before tool execution (cyan)
+  ${ANSI.green}PostToolUse${ANSI.reset}       : After tool execution (green)
+  ${ANSI.red}PostToolUseFailure${ANSI.reset}: Tool execution failed (red)
+  ${ANSI.yellow}PermissionRequest${ANSI.reset} : Permission requested (yellow)
+  ${ANSI.yellow}Notification${ANSI.reset}      : Notification events (yellow)
 
 Press ${ANSI.bold}Tab${ANSI.reset} to switch focus between sessions and hooks.
 Press ${ANSI.bold}Enter${ANSI.reset} on a hook to see full JSON payload.`,
@@ -821,7 +823,7 @@ function renderHooks(state: WatchState): string {
     const isSelected = isFocused && i === state.selectedHookIndex;
     const color = getEventColor(hook.event);
     const time = formatTimestamp(hook.timestamp);
-    const eventShort = hook.event.replace("pre-tool-use", "pre").replace("post-tool-use", "post");
+    const eventShort = hook.event;
     const payloadStr = formatHookPayload(hook.payload);
 
     const selectMark = isSelected ? `${ANSI.inverse}►${ANSI.reset}` : " ";
