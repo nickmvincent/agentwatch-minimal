@@ -174,6 +174,33 @@ export async function listPanes(
   return panes;
 }
 
+/** Common shell prompt patterns to filter out */
+const SHELL_PROMPT_PATTERNS = [
+  /^\s*[\$%>»›]\s*$/,           // Just a prompt character
+  /^\s*\S+[\$%#>]\s*$/,         // user@host$ or path$
+  /^\s*>>>\s*$/,                // Python REPL
+  /^\s*\.\.\.\s*$/,             // Continuation prompt
+  /^\s*\(.*\)\s*[\$%>]\s*$/,    // (venv) $
+  /^\s*\[\d+\]\s*[\$%>]\s*$/,   // [1] $ (job control)
+];
+
+/** Check if a line looks like a shell prompt */
+export function isShellPrompt(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  return SHELL_PROMPT_PATTERNS.some(p => p.test(trimmed));
+}
+
+/** Filter lines to only meaningful content (not prompts or empty) */
+export function filterMeaningfulLines(lines: string[]): string[] {
+  return lines.filter(line => {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    if (isShellPrompt(line)) return false;
+    return true;
+  });
+}
+
 export async function capturePane(
   target: string,
   lines = 10
@@ -187,11 +214,33 @@ export async function capturePane(
       "-S",
       `-${lines}`,
     ]);
-    // Return last non-empty line
-    const nonEmpty = output.split("\n").filter((l) => l.trim());
-    return nonEmpty.at(-1);
+    // Return last meaningful line (not a shell prompt)
+    const meaningful = filterMeaningfulLines(output.split("\n"));
+    return meaningful.at(-1);
   } catch {
     return undefined;
+  }
+}
+
+/** Capture last N meaningful lines from a pane (filters prompts and empty lines) */
+export async function capturePaneLines(
+  target: string,
+  maxLines = 3,
+  captureLines = 20
+): Promise<string[]> {
+  try {
+    const output = await runTmux([
+      "capture-pane",
+      "-t",
+      target,
+      "-p",
+      "-S",
+      `-${captureLines}`,
+    ]);
+    const meaningful = filterMeaningfulLines(output.split("\n"));
+    return meaningful.slice(-maxLines);
+  } catch {
+    return [];
   }
 }
 
@@ -322,7 +371,7 @@ export async function launchAgentSession(
   }
 }
 
-/** Capture multiple panes in parallel */
+/** Capture multiple panes in parallel (single line each) */
 export async function capturePanes(
   targets: string[],
   lines = 10
@@ -330,6 +379,21 @@ export async function capturePanes(
   const results = await Promise.all(
     targets.map(async (target) => {
       const content = await capturePane(target, lines);
+      return [target, content] as const;
+    })
+  );
+  return new Map(results);
+}
+
+/** Capture multiple panes in parallel (multiple meaningful lines each) */
+export async function capturePanesMultiline(
+  targets: string[],
+  maxLines = 2,
+  captureLines = 20
+): Promise<Map<string, string[]>> {
+  const results = await Promise.all(
+    targets.map(async (target) => {
+      const content = await capturePaneLines(target, maxLines, captureLines);
       return [target, content] as const;
     })
   );

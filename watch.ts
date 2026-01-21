@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import { serve } from "bun";
 import {
   listSessions,
-  capturePanes,
+  capturePanesMultiline,
   getProcessStatsBatch,
   detectAgentsBatch,
   killSession,
@@ -107,7 +107,7 @@ type WatchState = {
   sessions: TmuxSessionInfo[];
   visibleSessions: TmuxSessionInfo[];
   sessionMeta: Map<string, SessionMetaEntry>;
-  agentCache: Map<string, string>;  // session name -> detected agent (persists across refreshes)
+  agentCache: Map<number, string>;  // pane PID -> detected agent (persists across refreshes)
   recentHooks: HookEntry[];
   hooksPort: number;
   hooksEnabled: boolean;
@@ -616,32 +616,27 @@ const AGENT_COLORS: Record<string, string> = {
   gemini: ANSI.yellow,
 };
 
-function getSessionAgent(
-  session: TmuxSessionInfo,
+/** Get agent for a specific pane, using cache and detection */
+function getPaneAgent(
+  panePid: number | undefined,
   meta: SessionMetaEntry | undefined,
   detectedAgents: Map<number, DetectedAgent>,
-  agentCache: Map<string, string>,
-  agentsOnly: boolean
+  agentCache: Map<number, string>
 ): string | undefined {
-  // Priority 1: metadata from launch.ts
+  if (!panePid) return undefined;
+
+  // Priority 1: metadata from launch.ts (applies to all panes in session)
   if (meta?.agent) return meta.agent;
 
   // Priority 2: check cache (persists across refreshes)
-  const cached = agentCache.get(session.name);
+  const cached = agentCache.get(panePid);
   if (cached) return cached;
 
   // Priority 3: detect from process tree and cache result
-  const windows = getFilteredWindows(session, agentsOnly);
-  for (const window of windows) {
-    for (const pane of window.panes) {
-      if (pane.panePid) {
-        const detected = detectedAgents.get(pane.panePid);
-        if (detected) {
-          agentCache.set(session.name, detected.agent);
-          return detected.agent;
-        }
-      }
-    }
+  const detected = detectedAgents.get(panePid);
+  if (detected) {
+    agentCache.set(panePid, detected.agent);
+    return detected.agent;
   }
 
   return undefined;
@@ -649,7 +644,7 @@ function getSessionAgent(
 
 function renderSessions(
   state: WatchState,
-  capturedLines: Map<string, string | undefined>,
+  capturedLines: Map<string, string[]>,
   processStats: Map<number, ProcessStats>,
   detectedAgents: Map<number, DetectedAgent>,
   maxLines: number
@@ -694,28 +689,23 @@ function renderSessions(
     const durationStr = durationSec > 0 ? `${ANSI.dim}${formatDuration(durationSec)}${ANSI.reset}` : "";
     const statusBadge = meta?.status === "done" ? `${ANSI.dim}[done]${ANSI.reset}` : "";
 
-    // Detect agent for this session
-    const agentName = getSessionAgent(session, meta, detectedAgents, state.agentCache, agentsOnly);
-    const agentColor = agentName ? (AGENT_COLORS[agentName] || ANSI.blue) : "";
-    const agentBadge = agentName ? `${agentColor}[${agentName}]${ANSI.reset}` : "";
-
     const selectMark = isSelected ? `${ANSI.inverse}►${ANSI.reset}` : " ";
     const namePart = isSelected
       ? `${ANSI.bold}${ANSI.yellow}${session.name}${ANSI.reset}`
       : `${ANSI.bold}${session.name}${ANSI.reset}`;
 
-    // Collapsed: show summary with agent badge
+    // Collapsed: show summary (no agent badge - that's per-pane now)
     if (!isExpanded) {
       const lineIndex = lines.length - contentStart;
       if (isSelected) selectedLineIndex = lineIndex;
-      lines.push(`${selectMark}${attachIcon} ${namePart} ${agentBadge} ${durationStr}${statusBadge ? ` ${statusBadge}` : ""}`.trimEnd());
+      lines.push(`${selectMark}${attachIcon} ${namePart} ${durationStr}${statusBadge ? ` ${statusBadge}` : ""}`.trimEnd());
       continue;
     }
 
-    // Expanded: show full details with agent badge
+    // Expanded: show full details
     const lineIndex = lines.length - contentStart;
     if (isSelected) selectedLineIndex = lineIndex;
-    lines.push(`${selectMark}${attachIcon} ${namePart} ${agentBadge} ${durationStr}${statusBadge ? ` ${statusBadge}` : ""}`.trimEnd());
+    lines.push(`${selectMark}${attachIcon} ${namePart} ${durationStr}${statusBadge ? ` ${statusBadge}` : ""}`.trimEnd());
 
     const metaLine = formatSessionMeta(meta);
     if (metaLine) {
@@ -735,20 +725,20 @@ function renderSessions(
         const cmdStr = pane.command ? `${ANSI.blue}${pane.command}${ANSI.reset}` : "";
         const statsStr = showStats && pane.panePid ? ` ${formatStats(processStats.get(pane.panePid))}` : "";
 
-        // Show detected agent for this specific pane if different from session agent
-        const paneDetected = pane.panePid ? detectedAgents.get(pane.panePid) : undefined;
-        const paneAgentStr = paneDetected && paneDetected.agent !== agentName
-          ? ` ${AGENT_COLORS[paneDetected.agent] || ANSI.blue}(${paneDetected.agent})${ANSI.reset}`
+        // Show agent for this pane (from metadata or detection)
+        const paneAgent = getPaneAgent(pane.panePid, meta, detectedAgents, state.agentCache);
+        const paneAgentStr = paneAgent
+          ? ` ${AGENT_COLORS[paneAgent] || ANSI.blue}[${paneAgent}]${ANSI.reset}`
           : "";
 
         lines.push(`${indent}${paneActive}${cmdStr}${paneAgentStr}${statsStr}`);
 
         if (showLastLine) {
           const target = `${session.name}:${window.index}.${pane.paneIndex}`;
-          const lastLine = capturedLines.get(target);
-          if (lastLine) {
-            const truncated = lastLine.slice(0, 38);
-            lines.push(`${indent} ${ANSI.dim}${truncated}${lastLine.length > 38 ? "…" : ""}${ANSI.reset}`);
+          const paneLines = capturedLines.get(target) || [];
+          for (const line of paneLines) {
+            const truncated = line.slice(0, 50);
+            lines.push(`${indent} ${ANSI.dim}${truncated}${line.length > 50 ? "…" : ""}${ANSI.reset}`);
           }
         }
       }
@@ -969,12 +959,11 @@ async function renderDisplay(state: WatchState): Promise<string> {
     const windows = getFilteredWindows(session, agentsOnly);
     const meta = state.sessionMeta.get(session.name);
 
-    // Only collect PIDs for agent detection if we don't already know the agent
-    const needsDetection = !meta?.agent && !state.agentCache.has(session.name);
-    if (needsDetection) {
-      for (const window of windows) {
-        for (const pane of window.panes) {
-          if (pane.panePid) pidsNeedingDetection.push(pane.panePid);
+    // Collect PIDs for agent detection (skip if metadata has agent or PID is cached)
+    for (const window of windows) {
+      for (const pane of window.panes) {
+        if (pane.panePid && !meta?.agent && !state.agentCache.has(pane.panePid)) {
+          pidsNeedingDetection.push(pane.panePid);
         }
       }
     }
@@ -994,7 +983,7 @@ async function renderDisplay(state: WatchState): Promise<string> {
   }
 
   const [capturedLines, processStats, detectedAgents] = await Promise.all([
-    showLastLine ? capturePanes(paneTargets) : Promise.resolve(new Map<string, string | undefined>()),
+    showLastLine ? capturePanesMultiline(paneTargets, 2, 20) : Promise.resolve(new Map<string, string[]>()),
     showStats ? getProcessStatsBatch(panePids) : Promise.resolve(new Map<number, ProcessStats>()),
     pidsNeedingDetection.length > 0 ? detectAgentsBatch(pidsNeedingDetection) : Promise.resolve(new Map<number, DetectedAgent>()),
   ]);
