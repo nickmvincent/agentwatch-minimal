@@ -792,7 +792,7 @@ function renderSessions(
   return result.join("\n") + "\n";
 }
 
-function renderHooks(state: WatchState): string {
+function renderHooks(state: WatchState, maxVisibleLines = 15): string {
   const hooks = state.recentHooks;
   const isFocused = state.focusPanel === "hooks";
 
@@ -810,11 +810,31 @@ function renderHooks(state: WatchState): string {
     return output;
   }
 
-  // Show most recent first, with selection indicator
-  const reversed = [...hooks].reverse().slice(0, 15);
-  for (let i = 0; i < reversed.length; i++) {
-    const hook = reversed[i];
-    const isSelected = isFocused && i === state.selectedHookIndex;
+  // Show most recent first, with viewport scrolling
+  const reversed = [...hooks].reverse();
+  const totalHooks = reversed.length;
+
+  // Adjust scroll offset to keep selected item visible
+  let scrollOffset = state.hookScrollOffset;
+  if (state.selectedHookIndex < scrollOffset) {
+    scrollOffset = state.selectedHookIndex;
+  } else if (state.selectedHookIndex >= scrollOffset + maxVisibleLines) {
+    scrollOffset = state.selectedHookIndex - maxVisibleLines + 1;
+  }
+  scrollOffset = Math.max(0, Math.min(scrollOffset, Math.max(0, totalHooks - maxVisibleLines)));
+  state.hookScrollOffset = scrollOffset;
+
+  // Show scroll indicator at top if needed
+  if (scrollOffset > 0) {
+    output += `${ANSI.dim}↑ ${scrollOffset} more${ANSI.reset}\n`;
+  }
+
+  // Show visible hooks
+  const visibleHooks = reversed.slice(scrollOffset, scrollOffset + maxVisibleLines);
+  for (let i = 0; i < visibleHooks.length; i++) {
+    const hook = visibleHooks[i];
+    const actualIndex = scrollOffset + i;
+    const isSelected = isFocused && actualIndex === state.selectedHookIndex;
     const color = getEventColor(hook.event);
     const time = formatTimestamp(hook.timestamp);
     const eventShort = hook.event;
@@ -827,6 +847,12 @@ function renderHooks(state: WatchState): string {
     output += `${selectMark}${lineColor}${ANSI.dim}${time}${ANSI.reset} `;
     output += `${lineColor}${color}${eventShort.padEnd(5)}${ANSI.reset} `;
     output += `${lineColor}${ANSI.dim}${payloadStr}${ANSI.reset}${lineReset}\n`;
+  }
+
+  // Show scroll indicator at bottom if needed
+  const remaining = totalHooks - scrollOffset - maxVisibleLines;
+  if (remaining > 0) {
+    output += `${ANSI.dim}↓ ${remaining} more${ANSI.reset}\n`;
   }
 
   return output;
