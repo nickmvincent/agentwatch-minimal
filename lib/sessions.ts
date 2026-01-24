@@ -1,4 +1,4 @@
-import { appendJsonl } from "./jsonl";
+import { appendJsonl, readJsonl } from "./jsonl";
 import { createId } from "./ids";
 import { DEFAULT_DATA_DIR, type SessionMetaEntry } from "./types";
 
@@ -38,13 +38,7 @@ export async function appendSessionMeta(
 }
 
 export async function readSessionMeta(dataDir: string): Promise<SessionMetaEntry[]> {
-  const file = Bun.file(getSessionsFile(dataDir));
-  const exists = await file.exists();
-  if (!exists) return [];
-
-  const text = await file.text();
-  const lines = text.trim().split("\n").filter(Boolean);
-  return lines.map((line) => JSON.parse(line) as SessionMetaEntry);
+  return readJsonl<SessionMetaEntry>(getSessionsFile(dataDir));
 }
 
 export function buildSessionMetaMap(entries: SessionMetaEntry[]): Map<string, SessionMetaEntry> {
@@ -96,4 +90,3 @@ export async function markSessionDone(
 
   return { newName, entry };
 }
-

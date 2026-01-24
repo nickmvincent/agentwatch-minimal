@@ -24,8 +24,18 @@ export async function readJsonl<T>(filePath: string): Promise<T[]> {
   const expanded = expandHome(filePath);
   try {
     const content = await readFile(expanded, "utf8");
-    const lines = content.trim().split("\n").filter(Boolean);
-    return lines.map((line) => JSON.parse(line) as T);
+    const lines = content.split("\n");
+    const result: T[] = [];
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        result.push(JSON.parse(trimmed) as T);
+      } catch {
+        // Skip malformed JSONL lines
+      }
+    }
+    return result;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       return [];

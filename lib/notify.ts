@@ -55,6 +55,9 @@ export async function sendDesktopNotification(
   }
 }
 
+// Timeout for webhook requests
+const WEBHOOK_TIMEOUT_MS = 5000;
+
 /** Send a webhook notification */
 export async function sendWebhookNotification(
   url: string,
@@ -65,6 +68,7 @@ export async function sendWebhookNotification(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
     });
     return res.ok;
   } catch {

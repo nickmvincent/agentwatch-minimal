@@ -10,14 +10,41 @@ export function escapeShellArg(str: string): string {
 let hasServerCache: { value: boolean; timestamp: number } | null = null;
 const HAS_SERVER_CACHE_TTL = 5000;
 
+// Timeout for tmux/ps commands to prevent hanging on stalled server
+const COMMAND_TIMEOUT_MS = 5000;
+
+/** Run a command with a timeout, returning undefined if it times out */
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number
+): Promise<T | undefined> {
+  const timeout = new Promise<undefined>((resolve) => {
+    setTimeout(() => resolve(undefined), ms);
+  });
+  return Promise.race([promise, timeout]);
+}
+
 export async function runTmux(args: string[]): Promise<string> {
   const proc = Bun.spawn(["tmux", ...args], {
     stdout: "pipe",
     stderr: "pipe",
   });
-  const output = await new Response(proc.stdout).text();
-  await proc.exited;
-  return output.trim();
+
+  const result = await withTimeout(
+    (async () => {
+      const output = await new Response(proc.stdout).text();
+      await proc.exited;
+      return output.trim();
+    })(),
+    COMMAND_TIMEOUT_MS
+  );
+
+  if (result === undefined) {
+    proc.kill();
+    throw new Error(`tmux command timed out after ${COMMAND_TIMEOUT_MS}ms`);
+  }
+
+  return result;
 }
 
 export async function tmuxHasServer(): Promise<boolean> {
@@ -31,8 +58,17 @@ export async function tmuxHasServer(): Promise<boolean> {
       stdout: "pipe",
       stderr: "pipe",
     });
-    await proc.exited;
-    const result = proc.exitCode === 0;
+
+    const exitPromise = withTimeout(proc.exited, COMMAND_TIMEOUT_MS);
+    const exitCode = await exitPromise;
+
+    if (exitCode === undefined) {
+      proc.kill();
+      hasServerCache = { value: false, timestamp: Date.now() };
+      return false;
+    }
+
+    const result = exitCode === 0;
     hasServerCache = { value: result, timestamp: Date.now() };
     return result;
   } catch {
@@ -274,8 +310,13 @@ export async function createSession(
     stdout: "pipe",
     stderr: "pipe",
   });
-  await proc.exited;
-  return proc.exitCode === 0;
+
+  const exitCode = await withTimeout(proc.exited, COMMAND_TIMEOUT_MS);
+  if (exitCode === undefined) {
+    proc.kill();
+    return false;
+  }
+  return exitCode === 0;
 }
 
 export async function sendKeys(
@@ -289,17 +330,26 @@ export async function sendKeys(
     stdout: "pipe",
     stderr: "pipe",
   });
-  await proc.exited;
+
+  const exitCode = await withTimeout(proc.exited, COMMAND_TIMEOUT_MS);
+  if (exitCode === undefined) {
+    proc.kill();
+    return false;
+  }
 
   if (enter) {
     const enterProc = Bun.spawn(["tmux", "send-keys", "-t", target, "Enter"], {
       stdout: "pipe",
       stderr: "pipe",
     });
-    await enterProc.exited;
+    const enterExitCode = await withTimeout(enterProc.exited, COMMAND_TIMEOUT_MS);
+    if (enterExitCode === undefined) {
+      enterProc.kill();
+      return false;
+    }
   }
 
-  return proc.exitCode === 0;
+  return exitCode === 0;
 }
 
 export async function killSession(sessionName: string): Promise<boolean> {
@@ -307,8 +357,13 @@ export async function killSession(sessionName: string): Promise<boolean> {
     stdout: "pipe",
     stderr: "pipe",
   });
-  await proc.exited;
-  return proc.exitCode === 0;
+
+  const exitCode = await withTimeout(proc.exited, COMMAND_TIMEOUT_MS);
+  if (exitCode === undefined) {
+    proc.kill();
+    return false;
+  }
+  return exitCode === 0;
 }
 
 export async function renameSession(oldName: string, newName: string): Promise<boolean> {
@@ -316,8 +371,13 @@ export async function renameSession(oldName: string, newName: string): Promise<b
     stdout: "pipe",
     stderr: "pipe",
   });
-  await proc.exited;
-  return proc.exitCode === 0;
+
+  const exitCode = await withTimeout(proc.exited, COMMAND_TIMEOUT_MS);
+  if (exitCode === undefined) {
+    proc.kill();
+    return false;
+  }
+  return exitCode === 0;
 }
 
 export async function hasSession(sessionName: string): Promise<boolean> {
@@ -325,8 +385,13 @@ export async function hasSession(sessionName: string): Promise<boolean> {
     stdout: "pipe",
     stderr: "pipe",
   });
-  await proc.exited;
-  return proc.exitCode === 0;
+
+  const exitCode = await withTimeout(proc.exited, COMMAND_TIMEOUT_MS);
+  if (exitCode === undefined) {
+    proc.kill();
+    return false;
+  }
+  return exitCode === 0;
 }
 
 /** Launch an agent in a new tmux session with a prompt */
@@ -363,9 +428,14 @@ export async function launchAgentSession(
     ["tmux", "new-session", "-d", "-s", sessionName, "-c", cwd, fullCmd],
     { stdout: "pipe", stderr: "pipe" }
   );
-  await proc.exited;
 
-  if (proc.exitCode !== 0) {
+  const exitCode = await withTimeout(proc.exited, COMMAND_TIMEOUT_MS);
+  if (exitCode === undefined) {
+    proc.kill();
+    throw new Error(`tmux session creation timed out after ${COMMAND_TIMEOUT_MS}ms`);
+  }
+
+  if (exitCode !== 0) {
     const stderr = await new Response(proc.stderr).text();
     throw new Error(`Failed to create tmux session: ${stderr}`);
   }
@@ -427,13 +497,23 @@ export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, 
 
   // Return cached stats if still valid
   if (statsCache && Date.now() - statsCache.timestamp < STATS_CACHE_TTL) {
-    // Filter to only requested PIDs
-    const result = new Map<number, ProcessStats>();
+    let allPresent = true;
     for (const pid of pids) {
-      const cached = statsCache.data.get(pid);
-      if (cached) result.set(pid, cached);
+      if (!statsCache.data.has(pid)) {
+        allPresent = false;
+        break;
+      }
     }
-    return result;
+
+    if (allPresent) {
+      // Filter to only requested PIDs
+      const result = new Map<number, ProcessStats>();
+      for (const pid of pids) {
+        const cached = statsCache.data.get(pid);
+        if (cached) result.set(pid, cached);
+      }
+      return result;
+    }
   }
 
   try {
@@ -442,10 +522,23 @@ export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, 
       stdout: "pipe",
       stderr: "pipe",
     });
-    const output = await new Response(proc.stdout).text();
-    await proc.exited;
 
-    if (proc.exitCode !== 0) return new Map();
+    const psResult = await withTimeout(
+      (async () => {
+        const output = await new Response(proc.stdout).text();
+        await proc.exited;
+        return { output, exitCode: proc.exitCode };
+      })(),
+      COMMAND_TIMEOUT_MS
+    );
+
+    if (psResult === undefined) {
+      proc.kill();
+      return new Map();
+    }
+
+    if (psResult.exitCode !== 0) return new Map();
+    const output = psResult.output;
 
     // Build parent->children map and stats map
     const childrenMap = new Map<number, number[]>();
@@ -532,10 +625,23 @@ export async function detectAgentsBatch(pids: number[]): Promise<Map<number, Det
       stdout: "pipe",
       stderr: "pipe",
     });
-    const output = await new Response(proc.stdout).text();
-    await proc.exited;
 
-    if (proc.exitCode !== 0) return new Map();
+    const psResult = await withTimeout(
+      (async () => {
+        const output = await new Response(proc.stdout).text();
+        await proc.exited;
+        return { output, exitCode: proc.exitCode };
+      })(),
+      COMMAND_TIMEOUT_MS
+    );
+
+    if (psResult === undefined) {
+      proc.kill();
+      return new Map();
+    }
+
+    if (psResult.exitCode !== 0) return new Map();
+    const output = psResult.output;
 
     // Build parent->children map and command info map
     const childrenMap = new Map<number, number[]>();

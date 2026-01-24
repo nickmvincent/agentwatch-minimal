@@ -120,6 +120,21 @@ function normalizeTasks(rawTasks: Array<Partial<SubTask> & { agent?: string }>):
   });
 }
 
+function validatePlanDependencies(tasks: SubTask[]): string[] {
+  const ids = new Set(tasks.map((task) => task.id));
+  const errors: string[] = [];
+
+  for (const task of tasks) {
+    for (const dep of task.dependencies ?? []) {
+      if (!ids.has(dep)) {
+        errors.push(`[${task.id}] unknown dependency "${dep}"`);
+      }
+    }
+  }
+
+  return errors;
+}
+
 async function loadPlanFromFile(
   filePath: string,
   fallbackPrompt: string
@@ -311,6 +326,15 @@ Examples:
     console.log();
   }
 
+  const depErrors = validatePlanDependencies(plan.tasks);
+  if (depErrors.length > 0) {
+    console.error("Invalid dependencies in plan:");
+    for (const err of depErrors) {
+      console.error(`  ${err}`);
+    }
+    process.exit(1);
+  }
+
   if (dryRun) {
     console.log("─".repeat(60));
     console.log("Dry run - no agents launched");
@@ -335,6 +359,7 @@ Examples:
   const launched: Map<string, string> = new Map();
   // Track completed tasks (session no longer exists)
   const completed: Set<string> = new Set();
+  const failed: Set<string> = new Set();
 
   // Launch independent tasks in parallel
   const independentResults = await Promise.allSettled(
@@ -348,6 +373,7 @@ Examples:
       launched.set(task.id, result.value);
       console.log(`  [${task.id}] ${task.description} -> ${result.value}`);
     } else {
+      failed.add(task.id);
       console.error(`  [${task.id}] Failed: ${result.reason}`);
     }
   }
@@ -383,6 +409,13 @@ Examples:
         for (const task of dependent) {
           if (!pending.has(task.id)) continue;
           const deps = task.dependencies ?? [];
+          const failedDeps = deps.filter((d) => failed.has(d));
+          if (failedDeps.length > 0) {
+            pending.delete(task.id);
+            failed.add(task.id);
+            console.error(`  [${task.id}] skipped (failed deps: ${failedDeps.join(", ")})`);
+            continue;
+          }
           const allDepsComplete = deps.every((d) => completed.has(d));
 
           if (allDepsComplete) {
@@ -393,6 +426,7 @@ Examples:
               launched.set(task.id, sessionName);
               console.log(`  [${task.id}] ${task.description} -> ${sessionName}`);
             } catch (err) {
+              failed.add(task.id);
               console.error(`  [${task.id}] Failed: ${err}`);
             }
           }

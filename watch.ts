@@ -58,6 +58,8 @@ function isAgentCommand(cmd: string | undefined): boolean {
 type SortMode = "name" | "created" | "activity";
 
 const REFRESH_PRESETS = [1000, 2000, 5000, 10000] as const;
+const DEFAULT_MAX_CAPTURE_PANES = 50;
+const AGENT_CACHE_TTL_MS = 30000;
 
 // Filter popup options - all Claude Code hook event types
 const FILTER_OPTIONS = [
@@ -80,11 +82,17 @@ type FocusPanel = "sessions" | "hooks";
 
 type LastLineMode = 0 | 1 | 5;  // 0 = off, 1 = 1 line, 5 = 5 lines
 
+type AgentCacheEntry = {
+  agent: string;
+  expiresAt: number;
+};
+
 // State for the unified TUI
 type WatchState = {
   filter: string | undefined;
   intervalMs: number;
   lastLineMode: LastLineMode;
+  maxCapturePanes: number;
   showStats: boolean;
   showHelp: boolean;
   showDetailedHelp: boolean;  // true = show extended documentation
@@ -109,7 +117,7 @@ type WatchState = {
   sessions: TmuxSessionInfo[];
   visibleSessions: TmuxSessionInfo[];
   sessionMeta: Map<string, SessionMetaEntry>;
-  agentCache: Map<number, string>;  // pane PID -> detected agent (persists across refreshes)
+  agentCache: Map<number, AgentCacheEntry>;  // pane PID -> detected agent (persists across refreshes)
   recentHooks: HookEntry[];
   hooksPort: number;
   hooksEnabled: boolean;
@@ -352,6 +360,7 @@ ${ANSI.bold}Filtering & Display${ANSI.reset}
   --no-expand           Start with sessions collapsed
   --sort MODE           Initial sort: name, created, activity
   --no-last-line        Hide pane output
+  --max-capture N       Limit panes captured for last-line output (default: ${DEFAULT_MAX_CAPTURE_PANES})
   --no-stats            Hide CPU/memory stats
 
 ${ANSI.bold}Hooks Server${ANSI.reset}
@@ -618,12 +627,22 @@ const AGENT_COLORS: Record<string, string> = {
   gemini: ANSI.yellow,
 };
 
+function getCachedAgent(agentCache: Map<number, AgentCacheEntry>, pid: number): string | undefined {
+  const cached = agentCache.get(pid);
+  if (!cached) return undefined;
+  if (cached.expiresAt <= Date.now()) {
+    agentCache.delete(pid);
+    return undefined;
+  }
+  return cached.agent;
+}
+
 /** Get agent for a specific pane, using cache and detection */
 function getPaneAgent(
   panePid: number | undefined,
   meta: SessionMetaEntry | undefined,
   detectedAgents: Map<number, DetectedAgent>,
-  agentCache: Map<number, string>
+  agentCache: Map<number, AgentCacheEntry>
 ): string | undefined {
   if (!panePid) return undefined;
 
@@ -631,13 +650,16 @@ function getPaneAgent(
   if (meta?.agent) return meta.agent;
 
   // Priority 2: check cache (persists across refreshes)
-  const cached = agentCache.get(panePid);
+  const cached = getCachedAgent(agentCache, panePid);
   if (cached) return cached;
 
   // Priority 3: detect from process tree and cache result
   const detected = detectedAgents.get(panePid);
   if (detected) {
-    agentCache.set(panePid, detected.agent);
+    agentCache.set(panePid, {
+      agent: detected.agent,
+      expiresAt: Date.now() + AGENT_CACHE_TTL_MS,
+    });
     return detected.agent;
   }
 
@@ -986,20 +1008,22 @@ async function renderDisplay(state: WatchState): Promise<string> {
   output += `${ANSI.dim}${"─".repeat(70)}${ANSI.reset}\n\n`;
 
   // Collect pane data (only for expanded sessions to save resources)
-  const paneTargets: string[] = [];
+  const selectedPaneTargets: string[] = [];
+  const otherPaneTargets: string[] = [];
   const panePids: number[] = [];
   const pidsNeedingDetection: number[] = [];  // Only for sessions without known agent
 
   for (let i = 0; i < sessions.length; i++) {
     const session = sessions[i];
     const isExpanded = expandAll || i === state.selectedIndex;
+    const isSelected = i === state.selectedIndex;
     const windows = getFilteredWindows(session, agentsOnly);
     const meta = state.sessionMeta.get(session.name);
 
     // Collect PIDs for agent detection (skip if metadata has agent or PID is cached)
     for (const window of windows) {
       for (const pane of window.panes) {
-        if (pane.panePid && !meta?.agent && !state.agentCache.has(pane.panePid)) {
+        if (pane.panePid && !meta?.agent && !getCachedAgent(state.agentCache, pane.panePid)) {
           pidsNeedingDetection.push(pane.panePid);
         }
       }
@@ -1010,7 +1034,12 @@ async function renderDisplay(state: WatchState): Promise<string> {
     for (const window of windows) {
       for (const pane of window.panes) {
         if (lastLineMode > 0) {
-          paneTargets.push(`${session.name}:${window.index}.${pane.paneIndex}`);
+          const target = `${session.name}:${window.index}.${pane.paneIndex}`;
+          if (isSelected) {
+            selectedPaneTargets.push(target);
+          } else {
+            otherPaneTargets.push(target);
+          }
         }
         if (showStats && pane.panePid) {
           panePids.push(pane.panePid);
@@ -1019,8 +1048,18 @@ async function renderDisplay(state: WatchState): Promise<string> {
     }
   }
 
+  let paneTargets: string[] = [];
+  if (lastLineMode > 0) {
+    paneTargets = selectedPaneTargets.concat(otherPaneTargets);
+    if (state.maxCapturePanes > 0 && paneTargets.length > state.maxCapturePanes) {
+      paneTargets = paneTargets.slice(0, state.maxCapturePanes);
+    }
+  }
+
   const [capturedLines, processStats, detectedAgents] = await Promise.all([
-    lastLineMode > 0 ? capturePanesMultiline(paneTargets, lastLineMode, lastLineMode * 4) : Promise.resolve(new Map<string, string[]>()),
+    lastLineMode > 0 && paneTargets.length > 0
+      ? capturePanesMultiline(paneTargets, lastLineMode, lastLineMode * 4)
+      : Promise.resolve(new Map<string, string[]>()),
     showStats ? getProcessStatsBatch(panePids) : Promise.resolve(new Map<number, ProcessStats>()),
     pidsNeedingDetection.length > 0 ? detectAgentsBatch(pidsNeedingDetection) : Promise.resolve(new Map<number, DetectedAgent>()),
   ]);
@@ -1050,8 +1089,9 @@ async function forwardHook(url: string, event: string, payload: Record<string, u
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(2000),  // 2s timeout
     });
-  } catch {
-    // Silently ignore forwarding errors
+  } catch (err) {
+    // Log forwarding errors but don't throw
+    console.warn(`[agentwatch] Hook forward to ${url} failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -1076,14 +1116,16 @@ function createHooksApp(state: WatchState): Hono {
     // Write to file
     await appendJsonl(hooksFile(), entry);
 
-    // Forward to other servers (fire and forget)
+    // Forward to other servers (fire and forget, but log errors)
     for (const url of state.forwardUrls) {
-      forwardHook(url, event, payload).catch(() => {});
+      forwardHook(url, event, payload);
     }
 
-    // Notify if configured
+    // Notify if configured (fire and forget, but log errors)
     if (state.notifyConfig.desktop || state.notifyConfig.webhook) {
-      notifyHook(entry, state.notifyConfig).catch(() => {});
+      notifyHook(entry, state.notifyConfig).catch((err) => {
+        console.warn(`[agentwatch] Notification failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
     }
   };
 
@@ -1250,6 +1292,18 @@ async function refreshState(state: WatchState): Promise<void> {
   const entries = await readSessionMeta(state.dataDir).catch(() => []);
   state.sessionMeta = buildSessionMetaMap(entries);
 
+  const activePanePids = new Set<number>();
+  for (const session of state.sessions) {
+    for (const window of session.windowList) {
+      for (const pane of window.panes) {
+        if (pane.panePid) activePanePids.add(pane.panePid);
+      }
+    }
+  }
+  for (const pid of state.agentCache.keys()) {
+    if (!activePanePids.has(pid)) state.agentCache.delete(pid);
+  }
+
   if (state.visibleSessions.length > 0) {
     state.selectedIndex = Math.min(state.selectedIndex, state.visibleSessions.length - 1);
   } else {
@@ -1261,13 +1315,23 @@ async function interactiveLoop(state: WatchState): Promise<void> {
   process.stdout.write(ANSI.hideCursor);
   setupRawMode();
 
-  const cleanup = () => {
+  const cleanup = (code = 0) => {
     cleanupRawMode();
-    process.exit(0);
+    process.exit(code);
   };
 
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
+  process.on("SIGINT", () => cleanup(0));
+  process.on("SIGTERM", () => cleanup(0));
+  process.on("uncaughtException", (err) => {
+    cleanupRawMode();
+    console.error("Uncaught exception:", err);
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    cleanupRawMode();
+    console.error("Unhandled rejection:", reason);
+    process.exit(1);
+  });
 
   let needsRefresh = true;
   let lastRefresh = 0;
@@ -1623,6 +1687,7 @@ async function main() {
       filter: { type: "string", short: "f" },
       interval: { type: "string", short: "i", default: "2000" },
       "no-last-line": { type: "boolean" },
+      "max-capture": { type: "string", default: String(DEFAULT_MAX_CAPTURE_PANES) },
       "no-stats": { type: "boolean" },
       all: { type: "boolean", short: "A" },  // show all sessions, not just agents
       "no-expand": { type: "boolean" },      // collapse sessions by default
@@ -1656,6 +1721,7 @@ Options:
   --no-expand         Collapse sessions (default: all expanded)
   --sort              Sort sessions: name, created, activity
   --no-last-line      Hide pane output (shown by default)
+  --max-capture       Max panes to capture last-line output (default: ${DEFAULT_MAX_CAPTURE_PANES})
   --no-stats          Hide CPU/memory stats (shown by default)
 
   --hooks-port        Hooks server port (default: ${DEFAULT_HOOKS_PORT})
@@ -1703,6 +1769,18 @@ Examples:
   const hooksPort = parseInt(values["hooks-port"]!, 10);
   const isDaemon = values["hooks-daemon"] ?? false;
   const sortBy = parseSortMode(values.sort);
+  const intervalMs = parseInt(values.interval!, 10);
+
+  // Validate CLI arguments
+  if (isNaN(hooksPort) || hooksPort < 1 || hooksPort > 65535) {
+    console.error("Error: --hooks-port must be a valid port number (1-65535)");
+    process.exit(1);
+  }
+
+  if (isNaN(intervalMs) || intervalMs < 100) {
+    console.error("Error: --interval must be a number >= 100 (milliseconds)");
+    process.exit(1);
+  }
 
   if (values.sort && !sortBy) {
     console.error("Error: --sort must be one of: name, created, activity");
@@ -1710,11 +1788,16 @@ Examples:
   }
 
   const forwardUrls = values["forward-to"] ?? [];
+  const maxCaptureRaw = parseInt(values["max-capture"]!, 10);
+  const maxCapturePanes = Number.isFinite(maxCaptureRaw)
+    ? Math.max(0, maxCaptureRaw)
+    : DEFAULT_MAX_CAPTURE_PANES;
 
   const state: WatchState = {
     filter: values.filter,
-    intervalMs: parseInt(values.interval!, 10),
+    intervalMs,
     lastLineMode: values["no-last-line"] ? 0 : 1,  // 1 line by default
+    maxCapturePanes,
     showStats: !values["no-stats"],          // ON by default
     showHelp: false,
     showDetailedHelp: false,
