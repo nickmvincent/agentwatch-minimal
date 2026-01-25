@@ -1459,6 +1459,11 @@ async function interactiveLoop(state: WatchState): Promise<void> {
   let needsRefresh = true;
   let lastRefresh = 0;
 
+  // Handle terminal resize - trigger immediate refresh
+  process.on("SIGWINCH", () => {
+    needsRefresh = true;
+  });
+
   process.stdin.on("data", async (key: string) => {
     const code = key.charCodeAt(0);
     const maxSessionIndex = Math.max(0, state.visibleSessions.length - 1);
