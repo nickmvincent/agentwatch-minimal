@@ -1129,8 +1129,9 @@ async function renderDisplay(state: WatchState): Promise<string> {
   const headerLines = 6;  // header, indicators, runtime options, info bar, separator, blank
   const footerLines = 2;  // footer + blank
   const availableLines = termHeight - headerLines - footerLines;
-  // Let panels render fully - two-column layout handles vertical allocation dynamically
-  const maxSessionLines = availableLines;
+  // In two-column mode, let panels render more content so renderTwoColumn can allocate dynamically
+  // In single-column mode, use available lines directly
+  const maxSessionLines = showHooks ? availableLines * 3 : availableLines;
 
   // Header
   const sortLabel = sortBy ? ` ${ANSI.dim}sort:${sortBy}${ANSI.reset}` : "";
@@ -1232,7 +1233,8 @@ async function renderDisplay(state: WatchState): Promise<string> {
   const sessionsContent = renderSessions(state, capturedContent.lines, capturedContent.hashes, processStats, detectedAgents, maxSessionLines);
 
   if (showHooks && state.hooksEnabled) {
-    const hooksContent = renderHooks(state, availableLines);
+    // Pass higher limit so renderTwoColumn can allocate space dynamically
+    const hooksContent = renderHooks(state, availableLines * 3);
     output += renderTwoColumn(state, sessionsContent, hooksContent, availableLines);
   } else {
     output += sessionsContent;
