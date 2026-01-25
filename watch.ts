@@ -641,14 +641,65 @@ function renderTemplateEditor(state: WatchState): string {
   return output;
 }
 
-function renderTwoColumn(state: WatchState, leftContent: string, rightContent: string): string {
+function renderTwoColumn(
+  state: WatchState,
+  leftContent: string,
+  rightContent: string,
+  availableLines: number
+): string {
   const termWidth = process.stdout.columns || 120;
   const leftWidth = Math.floor(termWidth * 0.55);
   const rightWidth = termWidth - leftWidth - 3; // 3 for separator
 
-  const leftLines = leftContent.split("\n");
-  const rightLines = rightContent.split("\n");
-  const maxLines = Math.max(leftLines.length, rightLines.length);
+  let leftLines = leftContent.split("\n").filter(l => l.length > 0 || leftContent.includes(l));
+  let rightLines = rightContent.split("\n").filter(l => l.length > 0 || rightContent.includes(l));
+
+  // Remove trailing empty lines
+  while (leftLines.length > 0 && leftLines[leftLines.length - 1].trim() === "") leftLines.pop();
+  while (rightLines.length > 0 && rightLines[rightLines.length - 1].trim() === "") rightLines.pop();
+
+  const leftNeeds = leftLines.length;
+  const rightNeeds = rightLines.length;
+  const totalNeeds = Math.max(leftNeeds, rightNeeds);
+
+  // Dynamic vertical allocation
+  let maxLines = availableLines;
+  let leftTruncated = false;
+  let rightTruncated = false;
+
+  if (totalNeeds > availableLines) {
+    // Need to truncate - allocate proportionally with minimums
+    const minPerPanel = 5;  // Header + a few entries minimum
+    const allocatable = Math.max(0, availableLines - minPerPanel * 2);
+
+    // Give each panel its minimum plus proportional share of remaining
+    const leftRatio = leftNeeds / (leftNeeds + rightNeeds);
+    let leftAlloc = minPerPanel + Math.floor(allocatable * leftRatio);
+    let rightAlloc = availableLines - leftAlloc;
+
+    // If one panel needs less than its allocation, give extra to the other
+    if (leftNeeds <= leftAlloc && rightNeeds > rightAlloc) {
+      leftAlloc = Math.min(leftNeeds, leftAlloc);
+      rightAlloc = availableLines - leftAlloc;
+    } else if (rightNeeds <= rightAlloc && leftNeeds > leftAlloc) {
+      rightAlloc = Math.min(rightNeeds, rightAlloc);
+      leftAlloc = availableLines - rightAlloc;
+    }
+
+    // Apply truncation
+    if (leftLines.length > leftAlloc) {
+      leftLines = leftLines.slice(0, leftAlloc - 1);
+      leftLines.push(`${ANSI.dim}↓ ${leftNeeds - leftAlloc + 1} more${ANSI.reset}`);
+      leftTruncated = true;
+    }
+    if (rightLines.length > rightAlloc) {
+      rightLines = rightLines.slice(0, rightAlloc - 1);
+      rightLines.push(`${ANSI.dim}↓ ${rightNeeds - rightAlloc + 1} more${ANSI.reset}`);
+      rightTruncated = true;
+    }
+
+    maxLines = Math.max(leftLines.length, rightLines.length);
+  }
 
   let output = "";
 
@@ -660,7 +711,7 @@ function renderTwoColumn(state: WatchState, leftContent: string, rightContent: s
     const leftPlain = left.replace(/\x1b\[[0-9;]*m/g, "");
     const rightPlain = right.replace(/\x1b\[[0-9;]*m/g, "");
 
-    // Truncate if needed
+    // Truncate horizontally if needed
     const leftTrunc = leftPlain.length > leftWidth
       ? left.slice(0, leftWidth - 1) + "…"
       : left + " ".repeat(Math.max(0, leftWidth - leftPlain.length));
@@ -1073,12 +1124,13 @@ async function renderDisplay(state: WatchState): Promise<string> {
   let output = "";
   const now = new Date().toLocaleTimeString("en-US", { hour12: false });
 
-  // Calculate available lines for sessions panel
+  // Calculate available lines for content
   const termHeight = process.stdout.rows || 24;
   const headerLines = 6;  // header, indicators, runtime options, info bar, separator, blank
   const footerLines = 2;  // footer + blank
   const availableLines = termHeight - headerLines - footerLines;
-  const maxSessionLines = showHooks ? Math.floor(availableLines * 0.7) : availableLines;
+  // Let panels render fully - two-column layout handles vertical allocation dynamically
+  const maxSessionLines = availableLines;
 
   // Header
   const sortLabel = sortBy ? ` ${ANSI.dim}sort:${sortBy}${ANSI.reset}` : "";
@@ -1180,8 +1232,8 @@ async function renderDisplay(state: WatchState): Promise<string> {
   const sessionsContent = renderSessions(state, capturedContent.lines, capturedContent.hashes, processStats, detectedAgents, maxSessionLines);
 
   if (showHooks && state.hooksEnabled) {
-    const hooksContent = renderHooks(state);
-    output += renderTwoColumn(state, sessionsContent, hooksContent);
+    const hooksContent = renderHooks(state, availableLines);
+    output += renderTwoColumn(state, sessionsContent, hooksContent, availableLines);
   } else {
     output += sessionsContent;
   }
