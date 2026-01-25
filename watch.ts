@@ -4,16 +4,18 @@ import { serve } from "bun";
 import {
   listSessions,
   capturePanesMultiline,
+  capturePaneFull,
   getProcessStatsBatch,
   detectAgentsBatch,
   killSession,
+  quickHash,
   type DetectedAgent,
 } from "./lib/tmux";
 import { createId } from "./lib/ids";
 import { appendJsonl, readJsonlTail, expandHome } from "./lib/jsonl";
 import { notifyHook, type NotificationConfig, DEFAULT_TITLE_TEMPLATE, DEFAULT_MESSAGE_TEMPLATE } from "./lib/notify";
 import { formatHookPayload } from "./lib/hooks";
-import type { TmuxSessionInfo, ProcessStats, HookEntry, SessionMetaEntry } from "./lib/types";
+import type { TmuxSessionInfo, ProcessTreeStats, HookEntry, SessionMetaEntry, PaneActivityState, ActivityLevel } from "./lib/types";
 import { DEFAULT_HOOKS_PORT, DEFAULT_DATA_DIR } from "./lib/types";
 import { appendSessionMeta, buildSessionMetaMap, readSessionMeta, markSessionDone } from "./lib/sessions";
 
@@ -118,6 +120,7 @@ type WatchState = {
   visibleSessions: TmuxSessionInfo[];
   sessionMeta: Map<string, SessionMetaEntry>;
   agentCache: Map<number, AgentCacheEntry>;  // pane PID -> detected agent (persists across refreshes)
+  activityState: Map<string, PaneActivityState>;  // pane target -> activity state for change detection
   recentHooks: HookEntry[];
   hooksPort: number;
   hooksEnabled: boolean;
@@ -150,11 +153,121 @@ function formatMemory(kb: number): string {
   return `${(kb / 1024 / 1024).toFixed(1)}G`;
 }
 
-function formatStats(stats: ProcessStats | undefined): string {
+function formatStats(stats: ProcessTreeStats | undefined): string {
   if (!stats) return "";
   const cpu = stats.cpu > 0 ? `${stats.cpu.toFixed(0)}%` : "0%";
   const mem = formatMemory(stats.rss);
   return `${ANSI.cyan}cpu:${cpu} mem:${mem}${ANSI.reset}`;
+}
+
+// Activity detection thresholds
+const ACTIVITY_CPU_THRESHOLD = 0.5;  // CPU > 0.5% indicates working
+const ACTIVITY_IDLE_THRESHOLD = 30;  // Quiet > 30s is idle
+
+/** Assess activity level for a pane based on content changes and process state */
+function assessActivity(
+  activityState: Map<string, PaneActivityState>,
+  target: string,
+  currentContentHash: string,
+  stats: ProcessTreeStats | undefined,
+): { level: ActivityLevel; quietSeconds: number } {
+  const now = Date.now();
+  const existing = activityState.get(target);
+
+  // First time seeing this pane - initialize and mark as active
+  if (!existing) {
+    activityState.set(target, {
+      contentHash: currentContentHash,
+      lastContentChange: now,
+    });
+    return { level: "active", quietSeconds: 0 };
+  }
+
+  // Check if content changed
+  if (existing.contentHash !== currentContentHash) {
+    activityState.set(target, {
+      contentHash: currentContentHash,
+      lastContentChange: now,
+    });
+    return { level: "active", quietSeconds: 0 };
+  }
+
+  // Content unchanged - check how long
+  const quietMs = now - existing.lastContentChange;
+  const quietSeconds = Math.floor(quietMs / 1000);
+
+  // Check CPU usage (working = high CPU but no output)
+  if (stats && stats.cpu > ACTIVITY_CPU_THRESHOLD) {
+    return { level: "working", quietSeconds };
+  }
+
+  // Check for active processes (R or D state)
+  if (stats && stats.hasActiveProcess) {
+    return { level: "waiting", quietSeconds };
+  }
+
+  // No CPU, no active processes - check if idle threshold crossed
+  if (quietSeconds > ACTIVITY_IDLE_THRESHOLD) {
+    return { level: "idle", quietSeconds };
+  }
+
+  // Brief quiet period
+  return { level: "waiting", quietSeconds };
+}
+
+/** Format activity level for display */
+function formatActivity(a: { level: ActivityLevel; quietSeconds: number }): string {
+  switch (a.level) {
+    case "active":
+      return ` ${ANSI.green}●${ANSI.reset}`;
+    case "working":
+      return ` ${ANSI.cyan}◐${ANSI.reset}`;
+    case "waiting":
+      return a.quietSeconds > 5 ? ` ${ANSI.dim}○ ${a.quietSeconds}s${ANSI.reset}` : "";
+    case "idle":
+      return ` ${ANSI.yellow}○ ${formatDuration(a.quietSeconds)}${ANSI.reset}`;
+  }
+}
+
+/** Capture pane content for both display (last lines) and activity detection (hashes) */
+async function capturePanesForActivity(
+  targets: string[],
+  lastLineMode: LastLineMode
+): Promise<{ lines: Map<string, string[]>; hashes: Map<string, string> }> {
+  // Capture enough lines for both hashing (activity detection) and display
+  const captureLines = Math.max(30, lastLineMode > 0 ? lastLineMode * 4 : 0);
+
+  const results = await Promise.all(
+    targets.map(async (target) => {
+      const content = await capturePaneFull(target, captureLines);
+      const hash = quickHash(content);
+
+      // Filter for display lines if needed
+      let displayLines: string[] = [];
+      if (lastLineMode > 0) {
+        const lines = content.split("\n");
+        const meaningful = lines.filter(line => {
+          const trimmed = line.trim();
+          return trimmed.length > 0;
+        });
+        displayLines = meaningful.slice(-lastLineMode);
+      }
+
+      return { target, hash, displayLines };
+    })
+  );
+
+  const lines = new Map<string, string[]>();
+  const hashes = new Map<string, string>();
+
+  for (const { target, hash, displayLines } of results) {
+    hashes.set(target, hash);
+    if (displayLines.length > 0) {
+      lines.set(target, displayLines);
+    }
+  }
+
+  return { lines, hashes };
 }
 
 function formatTimestamp(ts: string): string {
@@ -669,7 +782,8 @@ function getPaneAgent(
 function renderSessions(
   state: WatchState,
   capturedLines: Map<string, string[]>,
-  processStats: Map<number, ProcessStats>,
+  contentHashes: Map<string, string>,
+  processStats: Map<number, ProcessTreeStats>,
   detectedAgents: Map<number, DetectedAgent>,
   maxLines: number
 ): string {
@@ -755,14 +869,14 @@ function renderSessions(
           ? ` ${AGENT_COLORS[paneAgent] || ANSI.blue}[${paneAgent}]${ANSI.reset}`
           : "";
 
-        // Show idle time (dim if idle > 10s, yellow if > 60s)
-        let idleStr = "";
-        if (pane.idleSeconds !== undefined && pane.idleSeconds > 5) {
-          const idleColor = pane.idleSeconds > 60 ? ANSI.yellow : ANSI.dim;
-          idleStr = ` ${idleColor}idle:${formatDuration(pane.idleSeconds)}${ANSI.reset}`;
-        }
+        // Show activity indicator based on content changes and process state
+        const target = `${session.name}:${window.index}.${pane.paneIndex}`;
+        const contentHash = contentHashes.get(target) || "";
+        const paneStats = pane.panePid ? processStats.get(pane.panePid) : undefined;
+        const activity = assessActivity(state.activityState, target, contentHash, paneStats);
+        const activityStr = formatActivity(activity);
 
-        lines.push(`${indent}${paneActive}${cmdStr}${paneAgentStr}${statsStr}${idleStr}`);
+        lines.push(`${indent}${paneActive}${cmdStr}${paneAgentStr}${statsStr}${activityStr}`);
 
         if (lastLineMode > 0) {
           const target = `${session.name}:${window.index}.${pane.paneIndex}`;
@@ -1033,38 +1147,37 @@ async function renderDisplay(state: WatchState): Promise<string> {
 
     for (const window of windows) {
       for (const pane of window.panes) {
-        if (lastLineMode > 0) {
-          const target = `${session.name}:${window.index}.${pane.paneIndex}`;
-          if (isSelected) {
-            selectedPaneTargets.push(target);
-          } else {
-            otherPaneTargets.push(target);
-          }
+        // Always collect targets for activity detection
+        const target = `${session.name}:${window.index}.${pane.paneIndex}`;
+        if (isSelected) {
+          selectedPaneTargets.push(target);
+        } else {
+          otherPaneTargets.push(target);
         }
-        if (showStats && pane.panePid) {
+        // Always collect PIDs for activity detection (process state + stats)
+        if (pane.panePid) {
           panePids.push(pane.panePid);
         }
       }
     }
   }
 
-  let paneTargets: string[] = [];
-  if (lastLineMode > 0) {
-    paneTargets = selectedPaneTargets.concat(otherPaneTargets);
-    if (state.maxCapturePanes > 0 && paneTargets.length > state.maxCapturePanes) {
-      paneTargets = paneTargets.slice(0, state.maxCapturePanes);
-    }
+  // Build list of pane targets (prioritize selected session)
+  let paneTargets = selectedPaneTargets.concat(otherPaneTargets);
+  if (state.maxCapturePanes > 0 && paneTargets.length > state.maxCapturePanes) {
+    paneTargets = paneTargets.slice(0, state.maxCapturePanes);
   }
 
-  const [capturedLines, processStats, detectedAgents] = await Promise.all([
-    lastLineMode > 0 && paneTargets.length > 0
-      ? capturePanesMultiline(paneTargets, lastLineMode, lastLineMode * 4)
-      : Promise.resolve(new Map<string, string[]>()),
-    showStats ? getProcessStatsBatch(panePids) : Promise.resolve(new Map<number, ProcessStats>()),
+  // Capture content for both display and activity hashing
+  const [capturedContent, processStats, detectedAgents] = await Promise.all([
+    paneTargets.length > 0
+      ? capturePanesForActivity(paneTargets, lastLineMode)
+      : Promise.resolve({ lines: new Map<string, string[]>(), hashes: new Map<string, string>() }),
+    getProcessStatsBatch(panePids),
     pidsNeedingDetection.length > 0 ? detectAgentsBatch(pidsNeedingDetection) : Promise.resolve(new Map<number, DetectedAgent>()),
   ]);
 
-  const sessionsContent = renderSessions(state, capturedLines, processStats, detectedAgents, maxSessionLines);
+  const sessionsContent = renderSessions(state, capturedContent.lines, capturedContent.hashes, processStats, detectedAgents, maxSessionLines);
 
   if (showHooks && state.hooksEnabled) {
     const hooksContent = renderHooks(state);
@@ -1292,16 +1405,26 @@ async function refreshState(state: WatchState): Promise<void> {
   const entries = await readSessionMeta(state.dataDir).catch(() => []);
   state.sessionMeta = buildSessionMetaMap(entries);
 
+  // Build set of active pane PIDs and targets for cleanup
   const activePanePids = new Set<number>();
+  const activePaneTargets = new Set<string>();
   for (const session of state.sessions) {
     for (const window of session.windowList) {
       for (const pane of window.panes) {
         if (pane.panePid) activePanePids.add(pane.panePid);
+        activePaneTargets.add(`${session.name}:${window.index}.${pane.paneIndex}`);
       }
     }
   }
+
+  // Clean up stale agent cache entries
   for (const pid of state.agentCache.keys()) {
     if (!activePanePids.has(pid)) state.agentCache.delete(pid);
+  }
+
+  // Clean up stale activity state entries
+  for (const target of state.activityState.keys()) {
+    if (!activePaneTargets.has(target)) state.activityState.delete(target);
   }
 
   if (state.visibleSessions.length > 0) {
@@ -1823,6 +1946,7 @@ Examples:
     visibleSessions: [],
     sessionMeta: new Map(),
     agentCache: new Map(),
+    activityState: new Map(),
     recentHooks: [],
     hooksPort,
     hooksEnabled,

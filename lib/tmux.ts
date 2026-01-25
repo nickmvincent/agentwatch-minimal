@@ -1,5 +1,14 @@
-import type { TmuxSessionInfo, TmuxWindowInfo, TmuxPaneInfo, AgentType, ProcessStats } from "./types";
+import type { TmuxSessionInfo, TmuxWindowInfo, TmuxPaneInfo, AgentType, ProcessStats, ProcessTreeStats } from "./types";
 import { AGENT_CONFIGS } from "./types";
+
+/** Fast DJB2 hash for content change detection */
+export function quickHash(str: string): string {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash) + str.charCodeAt(i);
+  }
+  return (hash >>> 0).toString(36);
+}
 
 /** Escape a string for safe use in single-quoted shell argument */
 export function escapeShellArg(str: string): string {
@@ -488,11 +497,11 @@ function getDescendantsFromTree(pid: number, childrenMap: Map<number, number[]>)
 }
 
 // Cache for process stats (refresh every 5 seconds)
-let statsCache: { data: Map<number, ProcessStats>; timestamp: number } | null = null;
+let statsCache: { data: Map<number, ProcessTreeStats>; timestamp: number } | null = null;
 const STATS_CACHE_TTL = 5000;
 
 /** Get stats for multiple PIDs efficiently with a single ps call */
-export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, ProcessStats>> {
+export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, ProcessTreeStats>> {
   if (pids.length === 0) return new Map();
 
   // Return cached stats if still valid
@@ -507,7 +516,7 @@ export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, 
 
     if (allPresent) {
       // Filter to only requested PIDs
-      const result = new Map<number, ProcessStats>();
+      const result = new Map<number, ProcessTreeStats>();
       for (const pid of pids) {
         const cached = statsCache.data.get(pid);
         if (cached) result.set(pid, cached);
@@ -517,8 +526,8 @@ export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, 
   }
 
   try {
-    // Single ps call to get ALL processes with their parent PIDs and stats
-    const proc = Bun.spawn(["ps", "-axo", "pid,ppid,%cpu,%mem,rss"], {
+    // Single ps call to get ALL processes with their parent PIDs, stats, and state
+    const proc = Bun.spawn(["ps", "-axo", "pid,ppid,%cpu,%mem,rss,state"], {
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -540,24 +549,25 @@ export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, 
     if (psResult.exitCode !== 0) return new Map();
     const output = psResult.output;
 
-    // Build parent->children map and stats map
+    // Build parent->children map, stats map, and state map
     const childrenMap = new Map<number, number[]>();
-    const statsMap = new Map<number, { cpu: number; mem: number; rss: number }>();
+    const statsMap = new Map<number, { cpu: number; mem: number; rss: number; state: string }>();
 
     const lines = output.trim().split("\n");
     for (let i = 1; i < lines.length; i++) { // Skip header
       const values = lines[i].trim().split(/\s+/);
-      if (values.length < 5) continue;
+      if (values.length < 6) continue;
 
       const pid = parseInt(values[0], 10);
       const ppid = parseInt(values[1], 10);
       const cpu = parseFloat(values[2]) || 0;
       const mem = parseFloat(values[3]) || 0;
       const rss = parseInt(values[4], 10) || 0;
+      const state = values[5] || "";
 
       if (isNaN(pid)) continue;
 
-      statsMap.set(pid, { cpu, mem, rss });
+      statsMap.set(pid, { cpu, mem, rss, state });
 
       if (!isNaN(ppid)) {
         const siblings = childrenMap.get(ppid) || [];
@@ -567,7 +577,7 @@ export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, 
     }
 
     // Calculate totals for each requested PID (including descendants)
-    const result = new Map<number, ProcessStats>();
+    const result = new Map<number, ProcessTreeStats>();
     const pidSet = new Set(pids);
 
     for (const pid of pidSet) {
@@ -579,12 +589,20 @@ export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, 
       let totalMem = ownStats.mem;
       let totalRss = ownStats.rss;
 
+      // Check if any process in tree is in R (running) or D (disk I/O) state
+      // State codes: R=running, D=uninterruptible sleep (I/O), S=sleeping, I=idle, T=stopped, Z=zombie
+      const isActive = (s: string) => s.startsWith("R") || s.startsWith("D");
+      let hasActiveProcess = isActive(ownStats.state);
+
       for (const descPid of descendants) {
         const descStats = statsMap.get(descPid);
         if (descStats) {
           totalCpu += descStats.cpu;
           totalMem += descStats.mem;
           totalRss += descStats.rss;
+          if (!hasActiveProcess && isActive(descStats.state)) {
+            hasActiveProcess = true;
+          }
         }
       }
 
@@ -593,6 +611,7 @@ export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, 
         cpu: totalCpu,
         memory: totalMem,
         rss: totalRss,
+        hasActiveProcess,
       });
     }
 
@@ -605,7 +624,7 @@ export async function getProcessStatsBatch(pids: number[]): Promise<Map<number, 
 }
 
 /** Get CPU/memory stats for a process and all its descendants (uses batch internally) */
-export async function getProcessStats(pid: number): Promise<ProcessStats | undefined> {
+export async function getProcessStats(pid: number): Promise<ProcessTreeStats | undefined> {
   const batch = await getProcessStatsBatch([pid]);
   return batch.get(pid);
 }

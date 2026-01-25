@@ -85,6 +85,17 @@ export type ProcessStats = {
   rss: number;     // KB
 };
 
+export type ProcessTreeStats = ProcessStats & {
+  hasActiveProcess: boolean;  // true if any R/D state process in tree
+};
+
+export type PaneActivityState = {
+  contentHash: string;
+  lastContentChange: number;  // timestamp
+};
+
+export type ActivityLevel = "active" | "working" | "waiting" | "idle";
+
 export type AgentConfig = {
   command: string;
   defaultFlags?: string[];
