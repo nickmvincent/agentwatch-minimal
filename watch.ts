@@ -651,55 +651,11 @@ function renderTwoColumn(
   const leftWidth = Math.floor(termWidth * 0.55);
   const rightWidth = termWidth - leftWidth - 3; // 3 for separator
 
-  let leftLines = leftContent.split("\n").filter(l => l.length > 0 || leftContent.includes(l));
-  let rightLines = rightContent.split("\n").filter(l => l.length > 0 || rightContent.includes(l));
+  const leftLines = leftContent.split("\n");
+  const rightLines = rightContent.split("\n");
 
-  // Remove trailing empty lines
-  while (leftLines.length > 0 && leftLines[leftLines.length - 1].trim() === "") leftLines.pop();
-  while (rightLines.length > 0 && rightLines[rightLines.length - 1].trim() === "") rightLines.pop();
-
-  const leftNeeds = leftLines.length;
-  const rightNeeds = rightLines.length;
-  const totalNeeds = Math.max(leftNeeds, rightNeeds);
-
-  // Dynamic vertical allocation
-  let maxLines = availableLines;
-  let leftTruncated = false;
-  let rightTruncated = false;
-
-  if (totalNeeds > availableLines) {
-    // Need to truncate - allocate proportionally with minimums
-    const minPerPanel = 5;  // Header + a few entries minimum
-    const allocatable = Math.max(0, availableLines - minPerPanel * 2);
-
-    // Give each panel its minimum plus proportional share of remaining
-    const leftRatio = leftNeeds / (leftNeeds + rightNeeds);
-    let leftAlloc = minPerPanel + Math.floor(allocatable * leftRatio);
-    let rightAlloc = availableLines - leftAlloc;
-
-    // If one panel needs less than its allocation, give extra to the other
-    if (leftNeeds <= leftAlloc && rightNeeds > rightAlloc) {
-      leftAlloc = Math.min(leftNeeds, leftAlloc);
-      rightAlloc = availableLines - leftAlloc;
-    } else if (rightNeeds <= rightAlloc && leftNeeds > leftAlloc) {
-      rightAlloc = Math.min(rightNeeds, rightAlloc);
-      leftAlloc = availableLines - rightAlloc;
-    }
-
-    // Apply truncation
-    if (leftLines.length > leftAlloc) {
-      leftLines = leftLines.slice(0, leftAlloc - 1);
-      leftLines.push(`${ANSI.dim}↓ ${leftNeeds - leftAlloc + 1} more${ANSI.reset}`);
-      leftTruncated = true;
-    }
-    if (rightLines.length > rightAlloc) {
-      rightLines = rightLines.slice(0, rightAlloc - 1);
-      rightLines.push(`${ANSI.dim}↓ ${rightNeeds - rightAlloc + 1} more${ANSI.reset}`);
-      rightTruncated = true;
-    }
-
-    maxLines = Math.max(leftLines.length, rightLines.length);
-  }
+  // Use the taller panel's height (each panel manages its own scrolling)
+  const maxLines = Math.max(leftLines.length, rightLines.length);
 
   let output = "";
 
@@ -1129,9 +1085,8 @@ async function renderDisplay(state: WatchState): Promise<string> {
   const headerLines = 6;  // header, indicators, runtime options, info bar, separator, blank
   const footerLines = 2;  // footer + blank
   const availableLines = termHeight - headerLines - footerLines;
-  // In two-column mode, let panels render more content so renderTwoColumn can allocate dynamically
-  // In single-column mode, use available lines directly
-  const maxSessionLines = showHooks ? availableLines * 3 : availableLines;
+  // Each panel gets full available height (they're side-by-side, not stacked)
+  const maxSessionLines = availableLines;
 
   // Header
   const sortLabel = sortBy ? ` ${ANSI.dim}sort:${sortBy}${ANSI.reset}` : "";
@@ -1233,8 +1188,7 @@ async function renderDisplay(state: WatchState): Promise<string> {
   const sessionsContent = renderSessions(state, capturedContent.lines, capturedContent.hashes, processStats, detectedAgents, maxSessionLines);
 
   if (showHooks && state.hooksEnabled) {
-    // Pass higher limit so renderTwoColumn can allocate space dynamically
-    const hooksContent = renderHooks(state, availableLines * 3);
+    const hooksContent = renderHooks(state, availableLines);
     output += renderTwoColumn(state, sessionsContent, hooksContent, availableLines);
   } else {
     output += sessionsContent;
